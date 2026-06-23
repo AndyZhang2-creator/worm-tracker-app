@@ -1,3 +1,13 @@
+---
+title: Worm Tail Tracker
+emoji: 🪱
+colorFrom: green
+colorTo: gray
+sdk: docker
+app_port: 7860
+pinned: false
+---
+
 # Worm Tail Tracker
 
 A local web app that takes *C. elegans* microscope videos (~20 s each, up to
@@ -85,6 +95,34 @@ Both corrupt the data. The only correct behavior is to skip the interval. See
 A request that needs the model but can't find/load it returns **503** with an
 actionable message (where to put `best.pt`). One bad video in a batch returns an
 `"error"` entry for that video and does not abort the rest of the batch.
+
+## Deploy as a website (Hugging Face Spaces)
+
+This repo is Spaces-ready: a `Dockerfile` plus the YAML header at the top of
+this README (`sdk: docker`, `app_port: 7860`) are all a Docker Space needs.
+
+1. Create a new Space at <https://huggingface.co/new-space> → SDK **Docker** →
+   Blank. (CPU Basic, free, is fine; the site runs before the model exists.)
+2. Push this repo to the Space's git remote:
+   ```bash
+   pip install -U huggingface_hub
+   huggingface-cli login                       # paste a write token
+   git remote add space https://huggingface.co/spaces/<user>/worm-tracker-app
+   git push space master:main
+   ```
+   The Space builds the Docker image and serves the app at
+   `https://<user>-worm-tracker-app.hf.space`.
+3. Until you add the model, the site loads and shows the amber **"model not
+   ready"** pill (every analyze call returns a clean 503). To enable inference,
+   add the trained weights one of two ways:
+   - **Commit them:** drop `best.pt` into `model/`, `git push space` again
+     (use Git LFS for large files), or
+   - **Persistent storage:** attach Spaces persistent storage, upload `best.pt`
+     to `/data/`, and set the Space secret/variable
+     `WORM_MODEL_PATH=/data/best.pt`.
+
+Any other container host works too — `docker build -t worm-tracker . &&
+docker run -p 7860:7860 worm-tracker` serves it locally on port 7860.
 
 ## Project layout
 
