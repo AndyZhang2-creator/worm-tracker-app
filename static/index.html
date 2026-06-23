@@ -1,0 +1,501 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Worm Tail Tracker</title>
+<style>
+  /* ---- Theme: dark, precise, oscilloscope / scope-screen ----------------- */
+  :root {
+    --bg: #14171a;
+    --panel: #1b1f23;
+    --border: #2a2f35;
+    --text: #d7dadd;
+    --muted: #8a9098;
+    --accent: #6EE7A8;        /* bioluminescent green — the data / speed line */
+    --accent-dim: #6ee7a833;
+    --warn: #E8A33D;          /* amber — calibration / warnings / indicators  */
+    --warn-dim: #e8a33d22;
+    --sans: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
+    --mono: "IBM Plex Mono", "SF Mono", ui-monospace, "Cascadia Mono",
+            Menlo, Consolas, monospace;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 15px;
+    line-height: 1.5;
+    padding: 28px clamp(16px, 4vw, 48px) 64px;
+  }
+
+  /* Mono for ALL numeric data — the one deliberate typographic signature. */
+  .mono, input[type="number"], td.num, th.num, .stat-val, .pill code {
+    font-family: var(--mono);
+    font-variant-numeric: tabular-nums;
+  }
+
+  h1 {
+    font-size: 20px;
+    font-weight: 600;
+    letter-spacing: 0.01em;
+    margin: 0 0 2px;
+  }
+  .subtitle { color: var(--muted); font-size: 13px; margin: 0 0 24px; }
+
+  header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+
+  /* ---- Model-status pill -------------------------------------------------- */
+  .pill {
+    display: inline-flex; align-items: center; gap: 8px;
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 999px; padding: 6px 14px; font-size: 13px;
+    max-width: 520px;
+  }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); flex: none; }
+  .dot.ok { background: var(--accent); box-shadow: 0 0 8px var(--accent); }
+  .dot.bad { background: var(--warn); box-shadow: 0 0 8px var(--warn); }
+  .pill .detail { color: var(--muted); }
+
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 20px;
+    margin-bottom: 20px;
+  }
+
+  /* ---- Dropzone ----------------------------------------------------------- */
+  #dropzone {
+    border: 1.5px dashed var(--border);
+    border-radius: 10px;
+    padding: 36px 20px;
+    text-align: center;
+    color: var(--muted);
+    cursor: pointer;
+    transition: border-color 0.18s ease, background 0.18s ease;
+    background: #16191d;
+  }
+  #dropzone:hover, #dropzone.drag { border-color: var(--accent); background: var(--accent-dim); }
+  #dropzone strong { color: var(--text); }
+  #fileList { margin-top: 14px; font-size: 13px; color: var(--muted); }
+  #fileList .file { font-family: var(--mono); color: var(--text); }
+
+  /* ---- Settings ----------------------------------------------------------- */
+  .settings { display: flex; gap: 24px; flex-wrap: wrap; align-items: flex-end; }
+  .field { display: flex; flex-direction: column; gap: 6px; }
+  .field label { font-size: 12px; color: var(--muted); }
+  input[type="number"] {
+    background: #14171a; color: var(--text);
+    border: 1px solid var(--border); border-radius: 6px;
+    padding: 8px 10px; width: 130px; font-size: 14px;
+  }
+  input[type="number"]:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; border-color: var(--accent); }
+
+  /* ---- Buttons ------------------------------------------------------------ */
+  button {
+    font-family: var(--sans); font-size: 14px; font-weight: 500;
+    border-radius: 7px; padding: 10px 20px; cursor: pointer;
+    border: 1px solid var(--accent); background: var(--accent); color: #0c1410;
+    transition: filter 0.15s ease, opacity 0.15s ease;
+  }
+  button:hover:not(:disabled) { filter: brightness(1.08); }
+  button:disabled { opacity: 0.45; cursor: not-allowed; }
+  button:focus-visible { outline: 2px solid var(--text); outline-offset: 2px; }
+  button.ghost { background: transparent; color: var(--accent); }
+  a.dl {
+    display: inline-block; text-decoration: none; font-size: 14px; font-weight: 500;
+    border: 1px solid var(--warn); color: var(--warn); background: var(--warn-dim);
+    border-radius: 7px; padding: 10px 20px;
+  }
+  a.dl:focus-visible { outline: 2px solid var(--warn); outline-offset: 2px; }
+
+  .actions { display: flex; align-items: center; gap: 16px; margin-top: 18px; flex-wrap: wrap; }
+
+  /* ---- Errors ------------------------------------------------------------- */
+  #error {
+    display: none; margin-bottom: 20px; padding: 12px 16px;
+    border: 1px solid var(--warn); border-radius: 8px;
+    background: var(--warn-dim); color: var(--warn); font-size: 13px;
+  }
+
+  /* ---- Results table ------------------------------------------------------ */
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 500; font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; }
+  td.num, th.num { text-align: right; }
+  tbody tr { cursor: pointer; transition: background 0.12s ease; }
+  tbody tr:hover { background: #20262b; }
+  tbody tr.selected { background: var(--accent-dim); }
+  tbody tr.row-error { color: var(--warn); cursor: default; }
+  tbody tr.row-error:hover { background: transparent; }
+
+  /* ---- Chart -------------------------------------------------------------- */
+  #chartPanel { display: none; }
+  #chartTitle { font-size: 14px; font-weight: 600; margin: 0 0 4px; }
+  #chartMeta { font-size: 12px; color: var(--muted); margin: 0 0 14px; font-family: var(--mono); }
+  canvas { width: 100%; display: block; background: #101316; border: 1px solid var(--border); border-radius: 8px; }
+
+  .empty { color: var(--muted); font-size: 13px; padding: 8px 0; }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>Worm Tail Tracker</h1>
+    <p class="subtitle">Pose-tracked tail velocity for <em>C. elegans</em> clips.</p>
+  </div>
+  <div class="pill" id="modelPill">
+    <span class="dot" id="modelDot"></span>
+    <span id="modelText">checking model…</span>
+  </div>
+</header>
+
+<div id="error"></div>
+
+<!-- Files -->
+<div class="panel">
+  <div id="dropzone" tabindex="0" role="button" aria-label="Choose video files">
+    <strong>Drop videos here</strong> or click to browse
+    <div id="fileList"></div>
+  </div>
+  <input type="file" id="fileInput" accept="video/*" multiple hidden />
+</div>
+
+<!-- Settings + actions -->
+<div class="panel">
+  <div class="settings">
+    <div class="field">
+      <label for="sampleFps">sample_fps</label>
+      <input type="number" id="sampleFps" value="10" min="0.1" step="0.5" />
+    </div>
+    <div class="field">
+      <label for="pcutoff">pcutoff</label>
+      <input type="number" id="pcutoff" value="0.5" min="0" max="1" step="0.05" />
+    </div>
+    <div class="field">
+      <label for="pxPerMm">px_per_mm (optional)</label>
+      <input type="number" id="pxPerMm" placeholder="blank = pixels" min="0" step="0.1" />
+    </div>
+  </div>
+  <div class="actions">
+    <button id="analyzeBtn" disabled>Analyze</button>
+    <a id="downloadBtn" class="dl" style="display:none" href="#">Download CSV</a>
+  </div>
+</div>
+
+<!-- Results -->
+<div class="panel" id="resultsPanel" style="display:none">
+  <table>
+    <thead>
+      <tr>
+        <th>Video</th>
+        <th class="num">% tracked</th>
+        <th class="num" id="hAvg">avg (px/s)</th>
+        <th class="num" id="hMax">max (px/s)</th>
+        <th class="num" id="hDist">distance (px)</th>
+      </tr>
+    </thead>
+    <tbody id="resultsBody"></tbody>
+  </table>
+</div>
+
+<!-- Chart -->
+<div class="panel" id="chartPanel">
+  <p id="chartTitle"></p>
+  <p id="chartMeta"></p>
+  <canvas id="chart" width="900" height="320"></canvas>
+</div>
+
+<script>
+(() => {
+  "use strict";
+
+  const $ = (id) => document.getElementById(id);
+  const dropzone = $("dropzone");
+  const fileInput = $("fileInput");
+  const fileList = $("fileList");
+  const analyzeBtn = $("analyzeBtn");
+  const downloadBtn = $("downloadBtn");
+  const errorBox = $("error");
+  const resultsPanel = $("resultsPanel");
+  const resultsBody = $("resultsBody");
+  const chartPanel = $("chartPanel");
+
+  let chosenFiles = [];   // File[]
+  let lastResults = [];   // result objects from the backend
+  let usesMm = false;     // whether the current run used px_per_mm
+
+  // ---- Error surfacing (visible text, not just console) ------------------- //
+  function showError(msg) {
+    errorBox.textContent = msg;
+    errorBox.style.display = "block";
+  }
+  function clearError() {
+    errorBox.style.display = "none";
+    errorBox.textContent = "";
+  }
+
+  // ---- Model status pill -------------------------------------------------- //
+  async function loadModelStatus() {
+    try {
+      const res = await fetch("/api/model-status");
+      const data = await res.json();
+      if (data.ready) {
+        $("modelDot").className = "dot ok";
+        $("modelText").innerHTML = "model loaded";
+      } else {
+        $("modelDot").className = "dot bad";
+        $("modelText").innerHTML =
+          '<span class="detail">model not ready — ' + escapeHtml(data.detail || "") + "</span>";
+      }
+    } catch (e) {
+      $("modelDot").className = "dot bad";
+      $("modelText").innerHTML = '<span class="detail">backend unreachable</span>';
+    }
+  }
+
+  function escapeHtml(s) {
+    const d = document.createElement("div");
+    d.textContent = s;
+    return d.innerHTML;
+  }
+
+  // ---- File selection ----------------------------------------------------- //
+  function setFiles(files) {
+    chosenFiles = Array.from(files).filter((f) => f.type.startsWith("video/") || /\.(mp4|mov|avi|mkv|webm|m4v)$/i.test(f.name));
+    // Fall back: if filtering removed everything but user did pick files, keep raw.
+    if (chosenFiles.length === 0 && files.length > 0) chosenFiles = Array.from(files);
+    renderFileList();
+    analyzeBtn.disabled = chosenFiles.length === 0;
+  }
+
+  function renderFileList() {
+    if (chosenFiles.length === 0) {
+      fileList.textContent = "";
+      return;
+    }
+    const names = chosenFiles.map((f) => '<span class="file">' + escapeHtml(f.name) + "</span>").join(", ");
+    fileList.innerHTML = chosenFiles.length + " file" + (chosenFiles.length > 1 ? "s" : "") + ": " + names;
+  }
+
+  dropzone.addEventListener("click", () => fileInput.click());
+  dropzone.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); fileInput.click(); }
+  });
+  fileInput.addEventListener("change", () => setFiles(fileInput.files));
+
+  ["dragenter", "dragover"].forEach((ev) =>
+    dropzone.addEventListener(ev, (e) => { e.preventDefault(); dropzone.classList.add("drag"); })
+  );
+  ["dragleave", "drop"].forEach((ev) =>
+    dropzone.addEventListener(ev, (e) => { e.preventDefault(); dropzone.classList.remove("drag"); })
+  );
+  dropzone.addEventListener("drop", (e) => {
+    if (e.dataTransfer && e.dataTransfer.files) setFiles(e.dataTransfer.files);
+  });
+
+  // ---- Analyze ------------------------------------------------------------ //
+  analyzeBtn.addEventListener("click", async () => {
+    if (chosenFiles.length === 0) return;
+    clearError();
+    analyzeBtn.disabled = true;
+    const original = analyzeBtn.textContent;
+    analyzeBtn.textContent = "Analyzing…";
+    downloadBtn.style.display = "none";
+
+    const fd = new FormData();
+    const sampleFps = $("sampleFps").value || "10";
+    const pcutoff = $("pcutoff").value || "0.5";
+    const pxPerMm = $("pxPerMm").value.trim();
+    usesMm = pxPerMm !== "";
+
+    fd.append("sample_fps", sampleFps);
+    fd.append("pcutoff", pcutoff);
+    if (usesMm) fd.append("px_per_mm", pxPerMm);
+
+    // Always use the batch endpoint so we get a CSV token and uniform handling,
+    // even for a single file.
+    chosenFiles.forEach((f) => fd.append("files", f));
+
+    try {
+      const res = await fetch("/api/analyze-batch", { method: "POST", body: fd });
+      if (!res.ok) {
+        let detail = "Request failed (" + res.status + ")";
+        try { const j = await res.json(); if (j.detail) detail = j.detail; } catch (_) {}
+        showError(detail);
+        return;
+      }
+      const data = await res.json();
+      lastResults = data.results || [];
+      renderResults();
+      if (data.csv_token) {
+        downloadBtn.href = "/api/download/" + data.csv_token;
+        downloadBtn.style.display = "inline-block";
+      }
+    } catch (e) {
+      showError("Could not reach the backend: " + e.message);
+    } finally {
+      analyzeBtn.textContent = original;
+      analyzeBtn.disabled = chosenFiles.length === 0;
+    }
+  });
+
+  // ---- Results table ------------------------------------------------------ //
+  function unitSpeed() { return usesMm ? "mm/s" : "px/s"; }
+  function unitDist() { return usesMm ? "mm" : "px"; }
+  function fmt(v) { return (v === null || v === undefined) ? "—" : Number(v).toFixed(2); }
+
+  function renderResults() {
+    resultsPanel.style.display = lastResults.length ? "block" : "none";
+    chartPanel.style.display = "none";
+
+    $("hAvg").textContent = "avg (" + unitSpeed() + ")";
+    $("hMax").textContent = "max (" + unitSpeed() + ")";
+    $("hDist").textContent = "distance (" + unitDist() + ")";
+
+    resultsBody.innerHTML = "";
+    lastResults.forEach((r, idx) => {
+      const tr = document.createElement("tr");
+      if (r.error) {
+        tr.className = "row-error";
+        tr.innerHTML =
+          "<td>" + escapeHtml(r.video || "unknown") + "</td>" +
+          '<td class="num" colspan="4">error: ' + escapeHtml(r.error) + "</td>";
+      } else {
+        const avg = usesMm ? r.avg_speed_mm_s : r.avg_speed_px_s;
+        const max = usesMm ? r.max_speed_mm_s : r.max_speed_px_s;
+        const dist = usesMm ? r.total_distance_mm : r.total_distance_px;
+        tr.dataset.idx = idx;
+        tr.innerHTML =
+          "<td>" + escapeHtml(r.video) + "</td>" +
+          '<td class="num">' + fmt(r.frames_tracked_pct) + "</td>" +
+          '<td class="num">' + fmt(avg) + "</td>" +
+          '<td class="num">' + fmt(max) + "</td>" +
+          '<td class="num">' + fmt(dist) + "</td>";
+        tr.addEventListener("click", () => selectRow(idx, tr));
+      }
+      resultsBody.appendChild(tr);
+    });
+  }
+
+  function selectRow(idx, tr) {
+    document.querySelectorAll("#resultsBody tr").forEach((row) => row.classList.remove("selected"));
+    tr.classList.add("selected");
+    drawChart(lastResults[idx]);
+  }
+
+  // ---- Hand-drawn speed-over-time chart (no libraries) -------------------- //
+  function drawChart(r) {
+    chartPanel.style.display = "block";
+    $("chartTitle").textContent = r.video;
+    $("chartMeta").textContent =
+      "native " + fmt(r.native_fps) + " fps · effective " + fmt(r.effective_fps) +
+      " fps · " + r.frames_analyzed + " frames · " + fmt(r.frames_tracked_pct) + "% tracked";
+
+    const speeds = usesMm
+      ? scaleSeries(r.speed_series_px_s, r.avg_speed_px_s, r.avg_speed_mm_s)
+      : r.speed_series_px_s;
+    const times = r.time_series_s || speeds.map((_, i) => i);
+
+    const canvas = $("chart");
+    const ctx = canvas.getContext("2d");
+    // Crisp rendering on HiDPI: size the backing store to the displayed width.
+    const cssW = canvas.clientWidth || 900;
+    const cssH = 320;
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = cssW * dpr;
+    canvas.height = cssH * dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, cssW, cssH);
+
+    const padL = 56, padR = 16, padT = 16, padB = 34;
+    const plotW = cssW - padL - padR;
+    const plotH = cssH - padT - padB;
+
+    // Determine ranges, ignoring null gaps.
+    const valid = speeds.filter((v) => v !== null && v !== undefined && !Number.isNaN(v));
+    const maxSpeed = valid.length ? Math.max(...valid) : 1;
+    const maxTime = times.length ? Math.max(...times) : 1;
+    const yMax = maxSpeed > 0 ? maxSpeed * 1.1 : 1;
+
+    const xOf = (t) => padL + (maxTime > 0 ? (t / maxTime) * plotW : 0);
+    const yOf = (v) => padT + plotH - (v / yMax) * plotH;
+
+    // Grid + axes (scope-screen feel).
+    ctx.strokeStyle = "#2a2f35";
+    ctx.lineWidth = 1;
+    ctx.fillStyle = "#8a9098";
+    ctx.font = '11px "IBM Plex Mono", monospace';
+    const yTicks = 4;
+    for (let i = 0; i <= yTicks; i++) {
+      const val = (yMax / yTicks) * i;
+      const y = yOf(val);
+      ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(cssW - padR, y); ctx.stroke();
+      ctx.textAlign = "right"; ctx.textBaseline = "middle";
+      ctx.fillText(val.toFixed(1), padL - 8, y);
+    }
+    const xTicks = 5;
+    ctx.textAlign = "center"; ctx.textBaseline = "top";
+    for (let i = 0; i <= xTicks; i++) {
+      const t = (maxTime / xTicks) * i;
+      const x = xOf(t);
+      ctx.fillText(t.toFixed(1) + "s", x, cssH - padB + 8);
+    }
+
+    // Axis labels.
+    ctx.fillStyle = "#8a9098";
+    ctx.textAlign = "center";
+    ctx.fillText("time (s)", padL + plotW / 2, cssH - 12);
+    ctx.save();
+    ctx.translate(14, padT + plotH / 2);
+    ctx.rotate(-Math.PI / 2);
+    ctx.fillText("speed (" + unitSpeed() + ")", 0, 0);
+    ctx.restore();
+
+    // The speed line. Break the path across null gaps (untracked intervals) —
+    // do NOT connect across a gap, that's the whole point of NaN handling.
+    ctx.strokeStyle = "#6EE7A8";
+    ctx.lineWidth = 1.8;
+    ctx.beginPath();
+    let penDown = false;
+    speeds.forEach((v, i) => {
+      if (v === null || v === undefined || Number.isNaN(v)) {
+        penDown = false; // gap: lift the pen
+        return;
+      }
+      const x = xOf(times[i] !== undefined ? times[i] : i);
+      const y = yOf(v);
+      if (!penDown) { ctx.moveTo(x, y); penDown = true; }
+      else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+
+    // Mark gaps with faint amber ticks at the baseline so they're visible.
+    ctx.fillStyle = "#E8A33D";
+    speeds.forEach((v, i) => {
+      if (v === null || v === undefined || Number.isNaN(v)) {
+        const x = xOf(times[i] !== undefined ? times[i] : i);
+        ctx.fillRect(x - 0.75, padT + plotH - 4, 1.5, 4);
+      }
+    });
+  }
+
+  // When calibrated, convert the px/s series to mm/s using the same ratio the
+  // backend used (avg_mm / avg_px), so the chart axis matches the table.
+  function scaleSeries(series, avgPx, avgMm) {
+    if (!avgPx || !avgMm) return series;
+    const ratio = avgMm / avgPx;
+    return series.map((v) => (v === null || v === undefined ? null : v * ratio));
+  }
+
+  // ---- Init --------------------------------------------------------------- //
+  loadModelStatus();
+})();
+</script>
+</body>
+</html>

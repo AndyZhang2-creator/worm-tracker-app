@@ -1,0 +1,2 @@
+# Drop your trained Ultralytics YOLO-pose weights here as `best.pt`.
+# This file just keeps the directory in version control; the weights are not.
