@@ -118,11 +118,15 @@ RF_MODEL_ID = os.environ.get("ROBOFLOW_MODEL_ID", "c-elegan-detection-5haae/1")
 RF_WORKSPACE = os.environ.get("ROBOFLOW_WORKSPACE", "andy-zhang-ud8qm")
 RF_WORKFLOW = os.environ.get("ROBOFLOW_WORKFLOW_ID", "c-elegan-detection-v1-logic")
 RF_IMAGE_INPUT = os.environ.get("ROBOFLOW_IMAGE_INPUT", "image")
-# Which keypoint to track as the "tail" endpoint. This model emits two unnamed
-# endpoints ("End-point1"=0, "End-Point-2"=1) rather than head/tail, so we track
-# one consistently. Override by name (ROBOFLOW_TAIL_KEYPOINT) or index.
-RF_TAIL_KEYPOINT = os.environ.get("ROBOFLOW_TAIL_KEYPOINT", "").strip().lower()
-RF_TAIL_INDEX = int(os.environ.get("ROBOFLOW_TAIL_INDEX", "1"))
+# Endpoint selection. This model emits two endpoints ("End-point1"=0,
+# "End-Point-2"=1) rather than head/tail, and the two ends of a worm move
+# differently. By default we track BOTH per frame and report whichever moved the
+# most (greatest displacement from its start) — "the farthest tail". Override to
+# pin a specific endpoint by index (WORM_ENDPOINT_INDEX) or by class name
+# (ROBOFLOW_TAIL_KEYPOINT) if you'd rather always track the same one.
+FORCE_ENDPOINT_NAME = os.environ.get("ROBOFLOW_TAIL_KEYPOINT", "").strip().lower()
+_force_idx_raw = os.environ.get("WORM_ENDPOINT_INDEX", "").strip()
+FORCE_ENDPOINT_INDEX = int(_force_idx_raw) if _force_idx_raw.lstrip("-").isdigit() else None
 
 
 def _rf_mode() -> str:
@@ -217,17 +221,12 @@ def _find_predictions(obj):
     return None
 
 
-def _parse_roboflow_tail(data):
+def _parse_roboflow_keypoints(data):
     """
-    Pull (x, y, conf) for the tracked tail/endpoint of the most confident
-    detection from a Roboflow response, or None if no worm/keypoint was found.
-
-    Selection order:
-      1. an explicit ROBOFLOW_TAIL_KEYPOINT class name, if configured;
-      2. a keypoint literally named "tail" (for future head/tail models);
-      3. otherwise the configured index (RF_TAIL_INDEX, default 1).
-    This model emits "End-point1"/"End-Point-2" rather than head/tail, so we
-    track one endpoint consistently — which is all displacement/speed needs.
+    Return ALL keypoints of the most confident detection from a Roboflow
+    response as a list of (x, y, conf, name) in the model's keypoint order, or
+    None if no worm/keypoint was found. Endpoint selection happens later, after
+    we've seen how much each one moved across the whole clip.
     """
     preds = _find_predictions(data)
     if not preds:
@@ -237,20 +236,13 @@ def _parse_roboflow_tail(data):
     if not kps:
         return None
 
-    def name_of(kp):
-        return str(kp.get("class_name", kp.get("class", ""))).strip().lower()
-
-    tail = None
-    if RF_TAIL_KEYPOINT:
-        tail = next((kp for kp in kps if name_of(kp) == RF_TAIL_KEYPOINT), None)
-    if tail is None:
-        tail = next((kp for kp in kps if name_of(kp) == "tail"), None)
-    if tail is None:
-        idx = RF_TAIL_INDEX if 0 <= RF_TAIL_INDEX < len(kps) else (len(kps) - 1)
-        tail = kps[idx]
-
-    conf = tail.get("confidence")
-    return float(tail["x"]), float(tail["y"]), float(conf if conf is not None else 1.0)
+    out = []
+    for kp in kps:
+        name = str(kp.get("class_name", kp.get("class", ""))).strip()
+        conf = kp.get("confidence")
+        out.append((float(kp["x"]), float(kp["y"]),
+                    float(conf if conf is not None else 1.0), name))
+    return out
 
 
 def _roboflow_unconfigured_detail() -> str:
@@ -261,11 +253,11 @@ def _roboflow_unconfigured_detail() -> str:
     )
 
 
-def make_tail_detector():
+def make_detector():
     """
-    Build a `frame -> (x, y, conf) | None` callable for the active backend.
-    Raises HTTPException(503) if that backend isn't ready (no weights / no key),
-    so callers get the same clean 503 regardless of which backend is active.
+    Build a `frame -> list[(x, y, conf, name)] | None` callable for the active
+    backend (all keypoints of the best detection). Raises HTTPException(503) if
+    that backend isn't ready, so callers get the same clean 503 either way.
     """
     backend = active_backend()
     if backend == "roboflow":
@@ -273,14 +265,14 @@ def make_tail_detector():
             raise HTTPException(status_code=503, detail=_roboflow_unconfigured_detail())
 
         def detect(frame):
-            return _parse_roboflow_tail(_roboflow_infer(frame))
+            return _parse_roboflow_keypoints(_roboflow_infer(frame))
 
         return detect
 
     model = get_model()  # may raise HTTPException(503)
 
     def detect(frame):
-        return _extract_tail_keypoint(model(frame, verbose=False)[0])
+        return _extract_keypoints(model(frame, verbose=False)[0])
 
     return detect
 
@@ -289,12 +281,14 @@ def make_tail_detector():
 # Core per-video analysis
 # --------------------------------------------------------------------------- #
 
-def _extract_tail_keypoint(result):
-    """
-    From a single-frame YOLO result, return (x, y, conf) for the TAIL keypoint
-    of the highest-confidence detection, or None if no worm was detected.
+_YOLO_KP_NAMES = ["head", "tail"]  # index 0 = head, 1 = tail (build-spec contract)
 
-    Keypoint index 1 == tail (index 0 == head), per the fixed model contract.
+
+def _extract_keypoints(result):
+    """
+    From a single-frame YOLO result, return ALL keypoints of the highest-
+    confidence detection as a list of (x, y, conf, name), or None if no worm was
+    detected. Index 0 is named "head", index 1 "tail", per the model contract.
     """
     kpts = getattr(result, "keypoints", None)
     if kpts is None or kpts.xy is None or len(kpts.xy) == 0:
@@ -307,19 +301,17 @@ def _extract_tail_keypoint(result):
     else:
         best_i = 0
 
-    xy = kpts.xy[best_i].cpu().numpy()  # shape (2, 2): [[hx,hy],[tx,ty]]
-    if xy.shape[0] < 2:
+    xy = kpts.xy[best_i].cpu().numpy()  # shape (K, 2)
+    if xy.shape[0] == 0:
         return None
+    kconf = kpts.conf[best_i].cpu().numpy() if kpts.conf is not None else None
 
-    tail_x, tail_y = float(xy[1][0]), float(xy[1][1])
-
-    # Per-keypoint confidence; if the model didn't emit any, treat as 1.0.
-    if kpts.conf is not None:
-        tail_conf = float(kpts.conf[best_i].cpu().numpy()[1])
-    else:
-        tail_conf = 1.0
-
-    return tail_x, tail_y, tail_conf
+    out = []
+    for i in range(xy.shape[0]):
+        conf = float(kconf[i]) if kconf is not None else 1.0
+        name = _YOLO_KP_NAMES[i] if i < len(_YOLO_KP_NAMES) else f"kp{i}"
+        out.append((float(xy[i][0]), float(xy[i][1]), conf, name))
+    return out
 
 
 def analyze_video_file(path: str, sample_fps: float, pcutoff: float, px_per_mm):
@@ -329,7 +321,7 @@ def analyze_video_file(path: str, sample_fps: float, pcutoff: float, px_per_mm):
     Raises ValueError for un-openable / non-video files so callers can decide
     whether to abort (single) or record a per-video error (batch).
     """
-    detect = make_tail_detector()  # backend-agnostic; may raise HTTPException(503)
+    detect = make_detector()  # backend-agnostic; may raise HTTPException(503)
 
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
@@ -342,31 +334,57 @@ def analyze_video_file(path: str, sample_fps: float, pcutoff: float, px_per_mm):
     step = max(1, round(native_fps / sample_fps))
     effective_fps = native_fps / step  # <- THIS goes into compute_track_speed
 
-    xs, ys, confs = [], [], []
+    # Sequential read + skip; only run inference every step-th frame. Keep ALL
+    # keypoints per frame — we choose which endpoint to report after seeing how
+    # much each moved across the whole clip.
+    frames_kps = []  # each: list[(x,y,conf,name)] or None
     frame_idx = 0
     while True:
         ok, frame = cap.read()
         if not ok:
             break
-        # Sequential read + skip; only run inference every step-th frame.
         if frame_idx % step == 0:
-            kp = detect(frame)
-            if kp is None:
-                # Worm not detected this frame -> conf 0 so it falls below any
-                # sensible pcutoff and becomes a NaN gap, never a fake point.
-                xs.append(np.nan)
-                ys.append(np.nan)
-                confs.append(0.0)
-            else:
-                xs.append(kp[0])
-                ys.append(kp[1])
-                confs.append(kp[2])
+            frames_kps.append(detect(frame))
         frame_idx += 1
     cap.release()
 
-    frames_analyzed = len(xs)
+    frames_analyzed = len(frames_kps)
     if frames_analyzed == 0:
         raise ValueError("No frames could be decoded from this file.")
+
+    n_kp = max((len(f) for f in frames_kps if f), default=0)
+    if n_kp == 0:
+        raise ValueError("No worm/keypoints were ever detected in this video.")
+
+    # Build one (xs, ys, confs) track per keypoint index. A frame where the worm
+    # (or that keypoint) is missing becomes a NaN gap (conf 0), never a fake 0.
+    endpoint_names = ["" for _ in range(n_kp)]
+    tracks = [([], [], []) for _ in range(n_kp)]
+    for f in frames_kps:
+        for k in range(n_kp):
+            kp = f[k] if (f and k < len(f)) else None
+            kxs, kys, kconfs = tracks[k]
+            if kp is None:
+                kxs.append(np.nan); kys.append(np.nan); kconfs.append(0.0)
+            else:
+                kxs.append(kp[0]); kys.append(kp[1]); kconfs.append(kp[2])
+                if not endpoint_names[k] and len(kp) > 3 and kp[3]:
+                    endpoint_names[k] = kp[3]
+
+    # Per-endpoint displacement, then choose which endpoint to report: by
+    # default the one that moved the most ("the farthest tail").
+    per_endpoint = []
+    for k in range(n_kp):
+        kxs, kys, kconfs = tracks[k]
+        kd = compute_displacement(kxs, kys, kconfs, pcutoff=pcutoff, px_per_mm=px_per_mm)
+        per_endpoint.append({
+            "index": k,
+            "name": endpoint_names[k] or f"kp{k}",
+            "farthest_displacement_px": _round_or_none(kd["farthest_displacement_px"]),
+            "net_displacement_px": _round_or_none(kd["net_displacement_px"]),
+        })
+    chosen = _choose_endpoint(per_endpoint)
+    xs, ys, confs = tracks[chosen]
 
     metrics = compute_track_speed(
         xs, ys, confs, fps=effective_fps, pcutoff=pcutoff, px_per_mm=px_per_mm
@@ -397,6 +415,10 @@ def analyze_video_file(path: str, sample_fps: float, pcutoff: float, px_per_mm):
         "farthest_displacement_px": _round_or_none(disp["farthest_displacement_px"]),
         "net_displacement_px": _round_or_none(disp["net_displacement_px"]),
         "farthest_displacement_time_s": far_time,
+        # Which of the worm's endpoints we report: the one that moved the most.
+        "tracked_endpoint_index": chosen,
+        "tracked_endpoint_name": endpoint_names[chosen] or f"kp{chosen}",
+        "endpoints": per_endpoint,
         "speed_series_px_s": metrics["speed_series_px_s"],
         "time_series_s": time_series_s,
         "avg_speed_mm_s": _round_or_none(metrics.get("avg_speed_mm_s")),
@@ -406,6 +428,29 @@ def analyze_video_file(path: str, sample_fps: float, pcutoff: float, px_per_mm):
         "net_displacement_mm": _round_or_none(disp.get("net_displacement_mm")),
     }
     return response
+
+
+def _choose_endpoint(per_endpoint: list[dict]) -> int:
+    """
+    Pick which endpoint index to report. Default: the one that moved the
+    farthest from its start (greatest displacement) — "the farthest tail".
+    Overridable: a forced class name (ROBOFLOW_TAIL_KEYPOINT) or index
+    (WORM_ENDPOINT_INDEX) pins a specific endpoint instead.
+    """
+    if FORCE_ENDPOINT_NAME:
+        for ep in per_endpoint:
+            if ep["name"].strip().lower() == FORCE_ENDPOINT_NAME:
+                return ep["index"]
+    if FORCE_ENDPOINT_INDEX is not None:
+        for ep in per_endpoint:
+            if ep["index"] == FORCE_ENDPOINT_INDEX:
+                return ep["index"]
+    # Auto: greatest farthest-displacement (None sorts as -1, so a tracked
+    # endpoint always beats an untracked one).
+    return max(
+        per_endpoint,
+        key=lambda ep: ep["farthest_displacement_px"] if ep["farthest_displacement_px"] is not None else -1.0,
+    )["index"]
 
 
 def _round_or_none(v):

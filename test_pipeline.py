@@ -113,8 +113,12 @@ def main():
     assert abs(r30["farthest_displacement_px"] - 156.0) < 6.0, r30["farthest_displacement_px"]
     assert abs(r30["net_displacement_px"] - 156.0) < 6.0, r30["net_displacement_px"]
     assert r30["farthest_displacement_time_s"] is not None
+    # Both worm endpoints are tracked; one is auto-selected as "the farthest".
+    assert len(r30["endpoints"]) == 2, r30["endpoints"]
+    assert r30["tracked_endpoint_index"] in (0, 1)
     print(f"OK: tail displacement — farthest {r30['farthest_displacement_px']}px @ "
-          f"{r30['farthest_displacement_time_s']}s, net {r30['net_displacement_px']}px")
+          f"{r30['farthest_displacement_time_s']}s, net {r30['net_displacement_px']}px "
+          f"(tracked endpoint #{r30['tracked_endpoint_index']} of {len(r30['endpoints'])})")
 
     # Calibration switches units.
     rc = app.analyze_video_file(v30, sample_fps=10.0, pcutoff=0.5, px_per_mm=10.0)
@@ -190,21 +194,31 @@ def test_roboflow_parser():
             },
         ],
     }
-    tail = app._parse_roboflow_tail(resp)
-    assert tail is not None, "parser returned None"
-    # Highest-confidence (0.95) detection's index-1 endpoint -> (315, 205).
-    assert tail == (315.0, 205.0, 0.88), tail
-
-    # If a model DOES name a keypoint "tail", that wins over the index fallback.
-    resp_named = {"predictions": [
-        {"x": 1, "y": 1, "confidence": 0.7, "keypoints": [
-            {"x": 5, "y": 5, "class": "head"}, {"x": 9, "y": 7, "class": "tail"}]},
-    ]}
-    assert app._parse_roboflow_tail(resp_named) == (9.0, 7.0, 1.0)
+    kps = app._parse_roboflow_keypoints(resp)
+    assert kps is not None, "parser returned None"
+    # ALL keypoints of the highest-confidence (0.95) detection, in order.
+    assert kps == [
+        (290.0, 200.0, 0.92, "End-point1"),
+        (315.0, 205.0, 0.88, "End-Point-2"),
+    ], kps
 
     # No detections -> None (becomes a tracking gap, never a fake point).
-    assert app._parse_roboflow_tail({"predictions": []}) is None
-    print("OK: Roboflow parser — real End-Point schema, 'tail' name override, empty->None")
+    assert app._parse_roboflow_keypoints({"predictions": []}) is None
+    print("OK: Roboflow parser — returns all endpoints of the best detection")
+
+    # Endpoint selection: default picks the greatest-displacement endpoint;
+    # an untracked (None) endpoint never wins over a tracked one.
+    pe = [
+        {"index": 0, "name": "End-point1", "farthest_displacement_px": 12.0, "net_displacement_px": 5.0},
+        {"index": 1, "name": "End-Point-2", "farthest_displacement_px": 40.0, "net_displacement_px": 30.0},
+    ]
+    assert app._choose_endpoint(pe) == 1, app._choose_endpoint(pe)
+    pe2 = [
+        {"index": 0, "name": "a", "farthest_displacement_px": None, "net_displacement_px": None},
+        {"index": 1, "name": "b", "farthest_displacement_px": 3.0, "net_displacement_px": 3.0},
+    ]
+    assert app._choose_endpoint(pe2) == 1
+    print("OK: endpoint selection — greatest displacement wins, None never beats tracked")
 
 
 if __name__ == "__main__":

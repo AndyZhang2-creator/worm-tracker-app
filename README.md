@@ -52,8 +52,8 @@ Other Roboflow knobs (sensible defaults already point at this project's model):
 ```bash
 export ROBOFLOW_MODEL_ID=c-elegan-detection-5haae/1   # direct model (default)
 export ROBOFLOW_API_URL=https://serverless.roboflow.com  # default in model mode
-export ROBOFLOW_TAIL_INDEX=1          # which endpoint to track (0 or 1)
-export ROBOFLOW_TAIL_KEYPOINT=tail    # ...or pick the endpoint by class name
+export WORM_ENDPOINT_INDEX=0          # pin a specific endpoint (0 or 1) instead of auto
+export ROBOFLOW_TAIL_KEYPOINT=tail    # ...or pin the endpoint by class name
 # To use a Roboflow *workflow* instead of the direct model, set:
 #   ROBOFLOW_MODEL_ID=""  ROBOFLOW_WORKFLOW_ID=...  ROBOFLOW_API_URL=http://localhost:9001
 ```
@@ -68,10 +68,12 @@ Notes:
   `pip install inference && inference server start` (listens on `:9001`), then
   set `ROBOFLOW_API_URL=http://localhost:9001`.
 - **Endpoints, not head/tail.** This model emits two keypoints named
-  `End-point1` (id 0) and `End-Point-2` (id 1), not head/tail. We track one
-  endpoint consistently (index 1 by default), which is all that speed and
-  displacement need. `probe_roboflow.py` dumps the raw response if you want to
-  re-confirm the schema.
+  `End-point1` (id 0) and `End-Point-2` (id 1), not head/tail. The two ends of a
+  worm move differently, so by default the app tracks **both** and reports
+  whichever moved farthest from its start ("the farthest tail"); each video's
+  response includes an `endpoints` breakdown with both. Pin a specific end with
+  `WORM_ENDPOINT_INDEX=0|1` or `ROBOFLOW_TAIL_KEYPOINT=<name>`.
+  `probe_roboflow.py` dumps the raw response if you want to re-confirm the schema.
 - One HTTP round-trip per sampled frame, so it's slower than local weights —
   fine for short clips, and it's only the temporary stand-in until `best.pt`.
 
@@ -126,8 +128,11 @@ Per video (and as CSV columns):
 - **avg / max speed** — the average and peak tail speed (px/s, or mm/s if
   calibrated). The average is the headline "how fast the worm is moving".
 - **farthest tail** (`farthest_displacement`) — the maximum straight-line
-  distance the tail ever reached from its **first tracked position**: how far
-  the worm's tail got from where it started.
+  distance the tracked endpoint ever reached from its **first tracked
+  position**: how far that end of the worm got from where it started. By default
+  the tracked endpoint is whichever of the worm's two ends moved farthest (see
+  "Endpoints, not head/tail" above); `tracked_endpoint_name` and the `endpoints`
+  breakdown report which one and both ends' numbers.
 - **endpoint** (`net_displacement`) — straight-line distance from the first to
   the last tracked tail position (start → endpoint), regardless of path.
 - **distance** (`total_distance`) — total path length the tail travelled.
