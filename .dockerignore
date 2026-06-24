@@ -1,0 +1,11 @@
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+.git/
+.gitignore
+*.pt
+*.pth
+*.onnx
+test_pipeline.py
