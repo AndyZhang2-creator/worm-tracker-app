@@ -434,10 +434,11 @@
     chartPanel.style.display = "block";
     $("chartTitle").textContent = r.video;
     const far = usesMm ? r.farthest_displacement_mm : r.farthest_displacement_px;
+    const epName = r.tracked_endpoint_name || ("#" + r.tracked_endpoint_index);
     $("chartMeta").textContent =
       "native " + fmt(r.native_fps) + " fps · effective " + fmt(r.effective_fps) +
       " fps · " + r.frames_analyzed + " frames · " + fmt(r.frames_tracked_pct) + "% tracked · " +
-      "farthest tail " + fmt(far) + " " + unitDist() +
+      "tracking " + epName + " (farthest-moving end) · farthest " + fmt(far) + " " + unitDist() +
       (r.farthest_displacement_time_s != null ? " @ " + fmt(r.farthest_displacement_time_s) + "s" : "");
 
     const speeds = usesMm
