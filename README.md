@@ -27,6 +27,37 @@ ready" banner until you drop them in.
 pip install -r requirements.txt
 ```
 
+## Detection backends
+
+The app gets a per-frame tail `(x, y, confidence)` from one of two
+interchangeable backends, chosen by the `WORM_BACKEND` env var (auto-detected if
+unset):
+
+| Backend | When used | Notes |
+|---------|-----------|-------|
+| `ultralytics` | default; or `WORM_BACKEND=ultralytics` | Local YOLO-pose weights at `model/best.pt`. The permanent backend. |
+| `roboflow` | auto when `ROBOFLOW_API_KEY` is set; or `WORM_BACKEND=roboflow` | **Temporary** Roboflow Inference *workflow* over HTTP. Each frame is JPEG+base64-posted to `{api_url}/infer/workflows/{workspace}/{workflow_id}`. |
+
+Roboflow backend env vars (the API key is **never** committed to the repo):
+
+```bash
+export ROBOFLOW_API_KEY=...                      # required
+export ROBOFLOW_API_URL=http://localhost:9001    # default; or a hosted endpoint
+export ROBOFLOW_WORKSPACE=andy-zhang-ud8qm        # default
+export ROBOFLOW_WORKFLOW_ID=c-elegan-detection-v1-logic
+export WORM_BACKEND=roboflow                       # force it explicitly
+```
+
+To run a local Roboflow inference server: `pip install inference && inference
+server start` (listens on `:9001`). One HTTP round-trip per sampled frame, so it
+is slower than local weights — fine for short clips, and it's only temporary.
+
+> The hosted (serverless) version of the workflow currently fails to compile
+> (`InnerWorkflowParameterBindingsUnknownInputError` on `model_id`). Until that's
+> fixed in the Roboflow workflow editor, use a local inference server. Use
+> `probe_roboflow.py` to dump the raw workflow response and confirm the keypoint
+> schema the parser expects.
+
 ## Add your trained model
 
 Export your trained Ultralytics YOLO-pose weights and place them at:
@@ -66,9 +97,33 @@ Then open <http://localhost:8000>.
      *untracked* (a gap), not as zero movement (see "Why gaps" below).
    - **px_per_mm** (optional) — leave blank to stay in pixels; set it to convert
      every speed/distance to millimetres.
-3. Click **Analyze**. Results appear in a table; click any row to see that
-   video's speed-over-time chart.
+3. Click **Analyze**. A summary banner shows the headline numbers, results
+   appear in a table, and clicking any row draws that video's speed-over-time
+   chart (with an amber marker at the moment the tail was farthest from start).
 4. After a batch run, **Download CSV** exports the summary table.
+
+### Metrics reported
+
+Per video (and as CSV columns):
+
+- **avg / max speed** — the average and peak tail speed (px/s, or mm/s if
+  calibrated). The average is the headline "how fast the worm is moving".
+- **farthest tail** (`farthest_displacement`) — the maximum straight-line
+  distance the tail ever reached from its **first tracked position**: how far
+  the worm's tail got from where it started.
+- **endpoint** (`net_displacement`) — straight-line distance from the first to
+  the last tracked tail position (start → endpoint), regardless of path.
+- **distance** (`total_distance`) — total path length the tail travelled.
+
+Batch summary banner:
+
+- **average worm speed** — mean of the per-video average speeds.
+- **farthest tail moved** — the largest `farthest_displacement` across the
+  batch, and which video it came from.
+
+All displacement metrics use the same NaN-gap rule as speed: low-confidence
+frames are excluded and measured relative to the first *tracked* frame, so a
+blurry opening frame never anchors the measurement to a garbage point.
 
 ## Why low-confidence frames become gaps, not zeros
 

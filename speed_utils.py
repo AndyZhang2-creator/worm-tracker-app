@@ -74,6 +74,58 @@ def compute_track_speed(xs, ys, confs, fps, pcutoff=0.5, px_per_mm=None):
     return out
 
 
+def compute_displacement(xs, ys, confs, pcutoff=0.5, px_per_mm=None):
+    """
+    Displacement metrics for ONE keypoint track (here: the tail).
+
+    farthest_displacement: the maximum straight-line distance the tail ever
+        reaches from its FIRST tracked position — i.e. how far the tail got from
+        where it started ("how far the farthest tail moves").
+    net_displacement: straight-line distance from the first tracked position to
+        the LAST tracked position (start -> endpoint), regardless of the path.
+
+    Low-confidence frames are excluded (same NaN rule as compute_track_speed): a
+    bad detection must never count as a real position. Displacement is measured
+    relative to the first *tracked* frame, not frame 0, so a blurry opening
+    frame doesn't anchor the whole measurement to a garbage point.
+
+    Returns px values (and *_mm if px_per_mm given), plus the frame index of the
+    farthest point so the UI can mark when it happened.
+    """
+    xs = np.asarray(xs, dtype=float)
+    ys = np.asarray(ys, dtype=float)
+    confs = np.asarray(confs, dtype=float)
+
+    valid = confs >= pcutoff
+    x = np.where(valid, xs, np.nan)
+    y = np.where(valid, ys, np.nan)
+    idx = np.where(valid)[0]
+
+    out = {
+        "farthest_displacement_px": None,
+        "net_displacement_px": None,
+        "farthest_displacement_frame": None,
+    }
+    if len(idx) == 1:
+        out["farthest_displacement_px"] = 0.0
+        out["net_displacement_px"] = 0.0
+        out["farthest_displacement_frame"] = int(idx[0])
+    elif len(idx) >= 2:
+        x0, y0 = x[idx[0]], y[idx[0]]
+        dist_from_start = np.sqrt((x - x0) ** 2 + (y - y0) ** 2)  # NaN where invalid
+        far_i = int(np.nanargmax(dist_from_start))
+        out["farthest_displacement_px"] = float(dist_from_start[far_i])
+        out["farthest_displacement_frame"] = far_i
+        xl, yl = x[idx[-1]], y[idx[-1]]
+        out["net_displacement_px"] = float(np.sqrt((xl - x0) ** 2 + (yl - y0) ** 2))
+
+    if px_per_mm:
+        for key in ("farthest_displacement", "net_displacement"):
+            v = out[key + "_px"]
+            out[key + "_mm"] = (v / px_per_mm) if v is not None else None
+    return out
+
+
 def _safe_nanmean(arr):
     return None if len(arr) == 0 or np.all(np.isnan(arr)) else float(np.nanmean(arr))
 
