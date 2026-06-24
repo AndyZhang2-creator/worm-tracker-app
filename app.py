@@ -109,11 +109,35 @@ def get_model():
 # Roboflow workflow backend (temporary base model)
 # --------------------------------------------------------------------------- #
 
-RF_API_URL = os.environ.get("ROBOFLOW_API_URL", "http://localhost:9001").rstrip("/")
 RF_API_KEY = os.environ.get("ROBOFLOW_API_KEY", "")
+# Direct-model id (workspace-public, not secret). When set we call the model
+# endpoint directly — this avoids the broken serverless *workflow* (its inner
+# `model` step references an undeclared `model_id` input) and works both hosted
+# and on a local inference server. Set ROBOFLOW_MODEL_ID="" to use the workflow.
+RF_MODEL_ID = os.environ.get("ROBOFLOW_MODEL_ID", "c-elegan-detection-5haae/1")
 RF_WORKSPACE = os.environ.get("ROBOFLOW_WORKSPACE", "andy-zhang-ud8qm")
 RF_WORKFLOW = os.environ.get("ROBOFLOW_WORKFLOW_ID", "c-elegan-detection-v1-logic")
 RF_IMAGE_INPUT = os.environ.get("ROBOFLOW_IMAGE_INPUT", "image")
+# Which keypoint to track as the "tail" endpoint. This model emits two unnamed
+# endpoints ("End-point1"=0, "End-Point-2"=1) rather than head/tail, so we track
+# one consistently. Override by name (ROBOFLOW_TAIL_KEYPOINT) or index.
+RF_TAIL_KEYPOINT = os.environ.get("ROBOFLOW_TAIL_KEYPOINT", "").strip().lower()
+RF_TAIL_INDEX = int(os.environ.get("ROBOFLOW_TAIL_INDEX", "1"))
+
+
+def _rf_mode() -> str:
+    """'model' for direct-model inference (default), 'workflow' otherwise."""
+    return "model" if RF_MODEL_ID else "workflow"
+
+
+def _rf_base() -> str:
+    """Resolve the inference base URL: explicit override, else a mode default."""
+    explicit = os.environ.get("ROBOFLOW_API_URL", "").strip()
+    if explicit:
+        return explicit.rstrip("/")
+    # Direct model works on the hosted serverless endpoint; the workflow path
+    # historically targets a local inference server.
+    return "https://serverless.roboflow.com" if _rf_mode() == "model" else "http://localhost:9001"
 
 
 def active_backend() -> str:
@@ -129,30 +153,42 @@ def active_backend() -> str:
 
 
 def _roboflow_infer(frame):
-    """POST one frame to the Roboflow workflow; return the parsed JSON."""
+    """POST one frame to Roboflow (direct model or workflow); return the JSON."""
     ok, buf = cv2.imencode(".jpg", frame)
     if not ok:
         raise ValueError("Failed to JPEG-encode frame for Roboflow.")
     b64 = base64.b64encode(buf.tobytes()).decode("ascii")
-    url = f"{RF_API_URL}/infer/workflows/{RF_WORKSPACE}/{RF_WORKFLOW}"
-    body = {
-        "api_key": RF_API_KEY,
-        "inputs": {RF_IMAGE_INPUT: {"type": "base64", "value": b64}},
-        "use_cache": True,
-    }
+    base = _rf_base()
+
+    if _rf_mode() == "model":
+        url = f"{base}/{RF_MODEL_ID}?api_key={RF_API_KEY}"
+        kwargs = dict(
+            content=b64,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+    else:
+        url = f"{base}/infer/workflows/{RF_WORKSPACE}/{RF_WORKFLOW}"
+        kwargs = dict(
+            json={
+                "api_key": RF_API_KEY,
+                "inputs": {RF_IMAGE_INPUT: {"type": "base64", "value": b64}},
+                "use_cache": True,
+            }
+        )
+
     last_exc = None
     for _ in range(2):  # one light retry for transient hiccups
         try:
-            resp = httpx.post(url, json=body, timeout=120)
+            resp = httpx.post(url, timeout=120, **kwargs)
             if resp.status_code != 200:
                 raise RuntimeError(
-                    f"Roboflow workflow returned HTTP {resp.status_code}: "
-                    f"{resp.text[:300]}"
+                    f"Roboflow returned HTTP {resp.status_code}: {resp.text[:300]}"
                 )
             return resp.json()
         except httpx.HTTPError as exc:
             last_exc = exc
-    raise RuntimeError(f"Could not reach Roboflow at {url}: {last_exc}")
+    safe_url = url.split("?")[0]  # never echo the api_key in errors
+    raise RuntimeError(f"Could not reach Roboflow at {safe_url}: {last_exc}")
 
 
 def _find_predictions(obj):
@@ -183,27 +219,36 @@ def _find_predictions(obj):
 
 def _parse_roboflow_tail(data):
     """
-    Pull (x, y, conf) for the TAIL keypoint of the most confident detection from
-    a Roboflow workflow response, or None if no worm/tail was found.
+    Pull (x, y, conf) for the tracked tail/endpoint of the most confident
+    detection from a Roboflow response, or None if no worm/keypoint was found.
 
-    Tail is matched by keypoint class name ("tail"); if names are absent we fall
-    back to index 1 (head=0, tail=1), matching the Ultralytics contract.
+    Selection order:
+      1. an explicit ROBOFLOW_TAIL_KEYPOINT class name, if configured;
+      2. a keypoint literally named "tail" (for future head/tail models);
+      3. otherwise the configured index (RF_TAIL_INDEX, default 1).
+    This model emits "End-point1"/"End-Point-2" rather than head/tail, so we
+    track one endpoint consistently — which is all displacement/speed needs.
     """
     preds = _find_predictions(data)
     if not preds:
         return None
     best = max(preds, key=lambda p: p.get("confidence", 0.0) or 0.0)
     kps = best.get("keypoints") or []
-    tail = None
-    for kp in kps:
-        name = str(kp.get("class_name", kp.get("class", ""))).strip().lower()
-        if name == "tail":
-            tail = kp
-            break
-    if tail is None and len(kps) >= 2:
-        tail = kps[1]
-    if tail is None:
+    if not kps:
         return None
+
+    def name_of(kp):
+        return str(kp.get("class_name", kp.get("class", ""))).strip().lower()
+
+    tail = None
+    if RF_TAIL_KEYPOINT:
+        tail = next((kp for kp in kps if name_of(kp) == RF_TAIL_KEYPOINT), None)
+    if tail is None:
+        tail = next((kp for kp in kps if name_of(kp) == "tail"), None)
+    if tail is None:
+        idx = RF_TAIL_INDEX if 0 <= RF_TAIL_INDEX < len(kps) else (len(kps) - 1)
+        tail = kps[idx]
+
     conf = tail.get("confidence")
     return float(tail["x"]), float(tail["y"]), float(conf if conf is not None else 1.0)
 
@@ -212,7 +257,7 @@ def _roboflow_unconfigured_detail() -> str:
     return (
         "Roboflow backend selected but ROBOFLOW_API_KEY is not set. Export "
         "ROBOFLOW_API_KEY (and optionally ROBOFLOW_API_URL, default "
-        f"{RF_API_URL}) to use the temporary workflow detector."
+        f"{_rf_base()}) to use the temporary detector."
     )
 
 
@@ -460,18 +505,20 @@ def model_status():
     if backend == "roboflow":
         if not RF_API_KEY:
             return {"ready": False, "backend": backend, "detail": _roboflow_unconfigured_detail()}
+        base = _rf_base()
+        target = f"{RF_MODEL_ID}" if _rf_mode() == "model" else f"workflow {RF_WORKSPACE}/{RF_WORKFLOW}"
         # Light reachability check against the inference server root.
         try:
-            httpx.get(RF_API_URL, timeout=4)
-            return {"ready": True, "backend": backend, "detail": f"Roboflow workflow @ {RF_API_URL}"}
+            httpx.get(base, timeout=5)
+            return {"ready": True, "backend": backend, "detail": f"Roboflow {target} @ {base}"}
         except httpx.HTTPError as exc:
             return {
                 "ready": False,
                 "backend": backend,
                 "detail": (
-                    f"Roboflow server not reachable at {RF_API_URL} ({exc}). Start a "
-                    f"local inference server (`inference server start`) or set "
-                    f"ROBOFLOW_API_URL to the hosted endpoint."
+                    f"Roboflow not reachable at {base} ({exc}). Start a local "
+                    f"inference server (`inference server start`) or set "
+                    f"ROBOFLOW_API_URL to a hosted endpoint."
                 ),
             }
 
