@@ -50,7 +50,7 @@ export WORM_BACKEND=roboflow        # optional — auto-on when the key is prese
 Other Roboflow knobs (sensible defaults already point at this project's model):
 
 ```bash
-export ROBOFLOW_MODEL_ID=c-elegan-detection-5haae/1   # direct model (default)
+export ROBOFLOW_MODEL_ID=c-elegan-detection-5haae/5   # direct model (default)
 export ROBOFLOW_API_URL=https://serverless.roboflow.com  # default in model mode
 export WORM_ENDPOINT_INDEX=0          # pin a specific endpoint (0 or 1) instead of auto
 export ROBOFLOW_TAIL_KEYPOINT=tail    # ...or pin the endpoint by class name
@@ -60,10 +60,11 @@ export ROBOFLOW_TAIL_KEYPOINT=tail    # ...or pin the endpoint by class name
 
 Notes:
 
-- **Direct model, not the workflow.** The published *workflow*
-  (`c-elegan-detection-v1-logic`) currently fails to compile on serverless
-  (`InnerWorkflowParameterBindingsUnknownInputError` on `model_id`). We sidestep
-  it by calling the underlying model (`c-elegan-detection-5haae/1`) directly,
+- **Direct model, not the workflow.** The published *workflows*
+  (`c-elegan-detection-v1-logic`, `-v5-logic`) currently fail to compile on
+  serverless (`InnerWorkflowParameterBindingsUnknownInputError` on `model_id`).
+  We sidestep
+  it by calling the underlying model (`c-elegan-detection-5haae/5`) directly,
   which works hosted with just the API key. To run a local server instead:
   `pip install inference && inference server start` (listens on `:9001`), then
   set `ROBOFLOW_API_URL=http://localhost:9001`.

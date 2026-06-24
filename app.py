@@ -114,7 +114,7 @@ RF_API_KEY = os.environ.get("ROBOFLOW_API_KEY", "")
 # endpoint directly — this avoids the broken serverless *workflow* (its inner
 # `model` step references an undeclared `model_id` input) and works both hosted
 # and on a local inference server. Set ROBOFLOW_MODEL_ID="" to use the workflow.
-RF_MODEL_ID = os.environ.get("ROBOFLOW_MODEL_ID", "c-elegan-detection-5haae/1")
+RF_MODEL_ID = os.environ.get("ROBOFLOW_MODEL_ID", "c-elegan-detection-5haae/5")
 RF_WORKSPACE = os.environ.get("ROBOFLOW_WORKSPACE", "andy-zhang-ud8qm")
 RF_WORKFLOW = os.environ.get("ROBOFLOW_WORKFLOW_ID", "c-elegan-detection-v1-logic")
 RF_IMAGE_INPUT = os.environ.get("ROBOFLOW_IMAGE_INPUT", "image")
