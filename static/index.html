@@ -141,6 +141,12 @@
   canvas { width: 100%; display: block; background: #101316; border: 1px solid var(--border); border-radius: 8px; }
 
   .empty { color: var(--muted); font-size: 13px; padding: 8px 0; }
+
+  /* ---- Batch summary stats ------------------------------------------------ */
+  .stats { display: flex; gap: 40px; flex-wrap: wrap; }
+  .stat-label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 4px; }
+  .stat-val { font-size: 26px; color: var(--accent); }
+  .stat-note { color: var(--muted); font-size: 12px; margin-top: 12px; font-family: var(--mono); }
 </style>
 </head>
 <body>
@@ -188,6 +194,16 @@
   </div>
 </div>
 
+<!-- Batch summary -->
+<div class="panel" id="summaryPanel" style="display:none">
+  <div class="stats">
+    <div class="stat"><div class="stat-label">worms analyzed</div><div class="stat-val" id="sCount">—</div></div>
+    <div class="stat"><div class="stat-label">average worm speed</div><div class="stat-val" id="sAvg">—</div></div>
+    <div class="stat"><div class="stat-label">farthest tail moved</div><div class="stat-val" id="sFar">—</div></div>
+  </div>
+  <div class="stat-note" id="sNote"></div>
+</div>
+
 <!-- Results -->
 <div class="panel" id="resultsPanel" style="display:none">
   <table>
@@ -197,6 +213,8 @@
         <th class="num">% tracked</th>
         <th class="num" id="hAvg">avg (px/s)</th>
         <th class="num" id="hMax">max (px/s)</th>
+        <th class="num" id="hFar">farthest tail (px)</th>
+        <th class="num" id="hNet">endpoint (px)</th>
         <th class="num" id="hDist">distance (px)</th>
       </tr>
     </thead>
@@ -245,13 +263,14 @@
     try {
       const res = await fetch("/api/model-status");
       const data = await res.json();
+      const tag = data.backend ? " (" + escapeHtml(data.backend) + ")" : "";
       if (data.ready) {
         $("modelDot").className = "dot ok";
-        $("modelText").innerHTML = "model loaded";
+        $("modelText").innerHTML = "model ready" + tag;
       } else {
         $("modelDot").className = "dot bad";
         $("modelText").innerHTML =
-          '<span class="detail">model not ready — ' + escapeHtml(data.detail || "") + "</span>";
+          '<span class="detail">model not ready' + tag + " — " + escapeHtml(data.detail || "") + "</span>";
       }
     } catch (e) {
       $("modelDot").className = "dot bad";
@@ -332,6 +351,7 @@
       }
       const data = await res.json();
       lastResults = data.results || [];
+      renderSummary(data.summary);
       renderResults();
       if (data.csv_token) {
         downloadBtn.href = "/api/download/" + data.csv_token;
@@ -356,6 +376,8 @@
 
     $("hAvg").textContent = "avg (" + unitSpeed() + ")";
     $("hMax").textContent = "max (" + unitSpeed() + ")";
+    $("hFar").textContent = "farthest tail (" + unitDist() + ")";
+    $("hNet").textContent = "endpoint (" + unitDist() + ")";
     $("hDist").textContent = "distance (" + unitDist() + ")";
 
     resultsBody.innerHTML = "";
@@ -365,22 +387,40 @@
         tr.className = "row-error";
         tr.innerHTML =
           "<td>" + escapeHtml(r.video || "unknown") + "</td>" +
-          '<td class="num" colspan="4">error: ' + escapeHtml(r.error) + "</td>";
+          '<td class="num" colspan="6">error: ' + escapeHtml(r.error) + "</td>";
       } else {
         const avg = usesMm ? r.avg_speed_mm_s : r.avg_speed_px_s;
         const max = usesMm ? r.max_speed_mm_s : r.max_speed_px_s;
         const dist = usesMm ? r.total_distance_mm : r.total_distance_px;
+        const far = usesMm ? r.farthest_displacement_mm : r.farthest_displacement_px;
+        const net = usesMm ? r.net_displacement_mm : r.net_displacement_px;
         tr.dataset.idx = idx;
         tr.innerHTML =
           "<td>" + escapeHtml(r.video) + "</td>" +
           '<td class="num">' + fmt(r.frames_tracked_pct) + "</td>" +
           '<td class="num">' + fmt(avg) + "</td>" +
           '<td class="num">' + fmt(max) + "</td>" +
+          '<td class="num">' + fmt(far) + "</td>" +
+          '<td class="num">' + fmt(net) + "</td>" +
           '<td class="num">' + fmt(dist) + "</td>";
         tr.addEventListener("click", () => selectRow(idx, tr));
       }
       resultsBody.appendChild(tr);
     });
+  }
+
+  // ---- Batch summary (the headline answers) ------------------------------- //
+  function renderSummary(s) {
+    const panel = $("summaryPanel");
+    if (!s || !s.videos_ok) { panel.style.display = "none"; return; }
+    panel.style.display = "block";
+    $("sCount").textContent = s.videos_ok + (s.videos_failed ? " / " + s.videos_total : "");
+    $("sAvg").textContent = (s.avg_speed === null ? "—" : Number(s.avg_speed).toFixed(2)) + " " + s.units_speed;
+    $("sFar").textContent = (s.farthest_displacement === null ? "—" : Number(s.farthest_displacement).toFixed(2)) + " " + s.units_distance;
+    let note = "";
+    if (s.farthest_displacement_video) note += "farthest tail reached in " + s.farthest_displacement_video;
+    if (s.videos_failed) note += (note ? " · " : "") + s.videos_failed + " video(s) failed";
+    $("sNote").textContent = note;
   }
 
   function selectRow(idx, tr) {
@@ -393,9 +433,12 @@
   function drawChart(r) {
     chartPanel.style.display = "block";
     $("chartTitle").textContent = r.video;
+    const far = usesMm ? r.farthest_displacement_mm : r.farthest_displacement_px;
     $("chartMeta").textContent =
       "native " + fmt(r.native_fps) + " fps · effective " + fmt(r.effective_fps) +
-      " fps · " + r.frames_analyzed + " frames · " + fmt(r.frames_tracked_pct) + "% tracked";
+      " fps · " + r.frames_analyzed + " frames · " + fmt(r.frames_tracked_pct) + "% tracked · " +
+      "farthest tail " + fmt(far) + " " + unitDist() +
+      (r.farthest_displacement_time_s != null ? " @ " + fmt(r.farthest_displacement_time_s) + "s" : "");
 
     const speeds = usesMm
       ? scaleSeries(r.speed_series_px_s, r.avg_speed_px_s, r.avg_speed_mm_s)
@@ -483,6 +526,20 @@
         ctx.fillRect(x - 0.75, padT + plotH - 4, 1.5, 4);
       }
     });
+
+    // Vertical amber marker at the moment the tail was farthest from its start.
+    if (r.farthest_displacement_time_s != null && maxTime > 0) {
+      const x = xOf(r.farthest_displacement_time_s);
+      ctx.strokeStyle = "#E8A33D";
+      ctx.setLineDash([4, 4]);
+      ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(x, padT); ctx.lineTo(x, padT + plotH); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = "#E8A33D";
+      ctx.textAlign = x > padL + plotW * 0.85 ? "right" : "left";
+      ctx.textBaseline = "top";
+      ctx.fillText("farthest", x + (ctx.textAlign === "right" ? -4 : 4), padT + 2);
+    }
   }
 
   // When calibrated, convert the px/s series to mm/s using the same ratio the

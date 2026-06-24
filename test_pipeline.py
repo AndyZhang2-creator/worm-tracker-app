@@ -108,10 +108,20 @@ def main():
     assert abs(r15["avg_speed_px_s"] - 60.0) < 2.0, r15["avg_speed_px_s"]
     print("OK: per-video native fps handled correctly (not skewed by a global fps)")
 
+    # Displacement metrics. The blob moves in a straight horizontal line, so the
+    # farthest reach from start == net (start->endpoint) == total path (~156px).
+    assert abs(r30["farthest_displacement_px"] - 156.0) < 6.0, r30["farthest_displacement_px"]
+    assert abs(r30["net_displacement_px"] - 156.0) < 6.0, r30["net_displacement_px"]
+    assert r30["farthest_displacement_time_s"] is not None
+    print(f"OK: tail displacement — farthest {r30['farthest_displacement_px']}px @ "
+          f"{r30['farthest_displacement_time_s']}s, net {r30['net_displacement_px']}px")
+
     # Calibration switches units.
     rc = app.analyze_video_file(v30, sample_fps=10.0, pcutoff=0.5, px_per_mm=10.0)
     assert abs(rc["avg_speed_mm_s"] - 12.0) < 0.3, rc["avg_speed_mm_s"]
-    print(f"OK: calibration px_per_mm=10 -> avg {rc['avg_speed_mm_s']} mm/s")
+    assert abs(rc["farthest_displacement_mm"] - 15.6) < 0.6, rc["farthest_displacement_mm"]
+    print(f"OK: calibration px_per_mm=10 -> avg {rc['avg_speed_mm_s']} mm/s, "
+          f"farthest {rc['farthest_displacement_mm']} mm")
 
     # Batch with a corrupt file in the middle: others survive, bad one errors.
     bad = os.path.join(tmp, "broken.mp4")
@@ -127,17 +137,79 @@ def main():
     assert "error" not in results[0] and "error" in results[1] and "error" not in results[2]
     print(f"OK: batch error isolation — bad file reported: {results[1]['error']!r}")
 
-    # CSV building (pixels + mm variants).
+    # Batch summary — the headline answers the user asked for.
+    summary = app._batch_summary(results, used_mm=False)
+    assert summary["videos_ok"] == 2 and summary["videos_failed"] == 1
+    # mean of the two per-video averages (~120 and ~60) -> ~90 px/s.
+    assert abs(summary["avg_speed"] - 90.0) < 3.0, summary["avg_speed"]
+    assert summary["farthest_displacement_video"] in ("clip30fps.mp4", "clip15fps.mp4")
+    print(f"OK: batch summary — {summary['videos_ok']} worms, avg "
+          f"{summary['avg_speed']} px/s, farthest {summary['farthest_displacement']}px "
+          f"in {summary['farthest_displacement_video']}")
+
+    # CSV building (pixels + mm variants), now including displacement columns.
     csv_px = app._build_csv(results, used_calibration=False)
     csv_mm = app._build_csv([rc], used_calibration=True)
     assert csv_px.splitlines()[0] == ",".join(app.CSV_BASE_COLUMNS)
+    assert "farthest_displacement_px" in csv_px.splitlines()[0]
     assert "broken.mp4" in csv_px
-    assert csv_mm.splitlines()[0].endswith("total_distance_mm")
-    print("OK: CSV header + rows correct (px and mm variants)")
+    assert csv_mm.splitlines()[0].endswith("net_displacement_mm")
+    print("OK: CSV header + rows correct (px and mm variants, incl. displacement)")
     print("\nCSV preview (pixels):")
     print(csv_px.strip())
 
+    # ---- Roboflow workflow parser (offline, mocked response) ---------------- #
+    test_roboflow_parser()
+
     print("\nALL OFFLINE PIPELINE TESTS PASSED")
+
+
+def test_roboflow_parser():
+    """Validate tail extraction from a realistic Roboflow workflow response."""
+    # Two detections; the more confident one's tail keypoint should win. Nested
+    # under an arbitrary output key to exercise the recursive finder.
+    resp = [
+        {
+            "model_predictions": {
+                "image": {"width": 640, "height": 480},
+                "predictions": [
+                    {
+                        "x": 100, "y": 100, "width": 50, "height": 20,
+                        "confidence": 0.40, "class": "worm",
+                        "keypoints": [
+                            {"x": 90, "y": 100, "confidence": 0.9, "class_name": "head"},
+                            {"x": 110, "y": 100, "confidence": 0.8, "class_name": "tail"},
+                        ],
+                    },
+                    {
+                        "x": 300, "y": 200, "width": 50, "height": 20,
+                        "confidence": 0.95, "class": "worm",
+                        "keypoints": [
+                            {"x": 290, "y": 200, "confidence": 0.92, "class_name": "head"},
+                            {"x": 315, "y": 205, "confidence": 0.88, "class_name": "tail"},
+                        ],
+                    },
+                ],
+            }
+        }
+    ]
+    tail = app._parse_roboflow_tail(resp)
+    assert tail is not None, "parser returned None"
+    x, y, conf = tail
+    # Should pick the 0.95-confidence detection's tail keypoint (315, 205).
+    assert (x, y) == (315.0, 205.0), tail
+    assert abs(conf - 0.88) < 1e-6, tail
+
+    # Fallback: no class_name -> use index 1 (tail) of the keypoints list.
+    resp2 = {"out": {"predictions": [
+        {"x": 1, "y": 1, "confidence": 0.7,
+         "keypoints": [{"x": 5, "y": 5}, {"x": 9, "y": 7}]},
+    ]}}
+    assert app._parse_roboflow_tail(resp2) == (9.0, 7.0, 1.0)
+
+    # No detections -> None (becomes a tracking gap, never a fake point).
+    assert app._parse_roboflow_tail([{"out": {"predictions": []}}]) is None
+    print("OK: Roboflow parser — picks highest-confidence tail, name + index fallback, empty->None")
 
 
 if __name__ == "__main__":
