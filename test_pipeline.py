@@ -165,51 +165,46 @@ def main():
 
 
 def test_roboflow_parser():
-    """Validate tail extraction from a realistic Roboflow workflow response."""
-    # Two detections; the more confident one's tail keypoint should win. Nested
-    # under an arbitrary output key to exercise the recursive finder.
-    resp = [
-        {
-            "model_predictions": {
-                "image": {"width": 640, "height": 480},
-                "predictions": [
-                    {
-                        "x": 100, "y": 100, "width": 50, "height": 20,
-                        "confidence": 0.40, "class": "worm",
-                        "keypoints": [
-                            {"x": 90, "y": 100, "confidence": 0.9, "class_name": "head"},
-                            {"x": 110, "y": 100, "confidence": 0.8, "class_name": "tail"},
-                        ],
-                    },
-                    {
-                        "x": 300, "y": 200, "width": 50, "height": 20,
-                        "confidence": 0.95, "class": "worm",
-                        "keypoints": [
-                            {"x": 290, "y": 200, "confidence": 0.92, "class_name": "head"},
-                            {"x": 315, "y": 205, "confidence": 0.88, "class_name": "tail"},
-                        ],
-                    },
+    """Validate endpoint extraction against the model's REAL response schema."""
+    # Real shape from c-elegan-detection-5haae/1: two endpoints named
+    # "End-point1" (id 0) and "End-Point-2" (id 1), NOT head/tail. Two
+    # detections; the more confident one wins. With default config (no "tail"
+    # name, RF_TAIL_INDEX=1) we track index 1 = "End-Point-2".
+    resp = {
+        "inference_id": "x", "time": 0.1,
+        "image": {"width": 1080, "height": 1920},
+        "predictions": [
+            {
+                "x": 100, "y": 100, "confidence": 0.40, "class": "C Elegan", "class_id": 0,
+                "keypoints": [
+                    {"x": 90, "y": 100, "confidence": 0.9, "class_id": 0, "class": "End-point1"},
+                    {"x": 110, "y": 100, "confidence": 0.8, "class_id": 1, "class": "End-Point-2"},
                 ],
-            }
-        }
-    ]
+            },
+            {
+                "x": 300, "y": 200, "confidence": 0.95, "class": "C Elegan", "class_id": 0,
+                "keypoints": [
+                    {"x": 290, "y": 200, "confidence": 0.92, "class_id": 0, "class": "End-point1"},
+                    {"x": 315, "y": 205, "confidence": 0.88, "class_id": 1, "class": "End-Point-2"},
+                ],
+            },
+        ],
+    }
     tail = app._parse_roboflow_tail(resp)
     assert tail is not None, "parser returned None"
-    x, y, conf = tail
-    # Should pick the 0.95-confidence detection's tail keypoint (315, 205).
-    assert (x, y) == (315.0, 205.0), tail
-    assert abs(conf - 0.88) < 1e-6, tail
+    # Highest-confidence (0.95) detection's index-1 endpoint -> (315, 205).
+    assert tail == (315.0, 205.0, 0.88), tail
 
-    # Fallback: no class_name -> use index 1 (tail) of the keypoints list.
-    resp2 = {"out": {"predictions": [
-        {"x": 1, "y": 1, "confidence": 0.7,
-         "keypoints": [{"x": 5, "y": 5}, {"x": 9, "y": 7}]},
-    ]}}
-    assert app._parse_roboflow_tail(resp2) == (9.0, 7.0, 1.0)
+    # If a model DOES name a keypoint "tail", that wins over the index fallback.
+    resp_named = {"predictions": [
+        {"x": 1, "y": 1, "confidence": 0.7, "keypoints": [
+            {"x": 5, "y": 5, "class": "head"}, {"x": 9, "y": 7, "class": "tail"}]},
+    ]}
+    assert app._parse_roboflow_tail(resp_named) == (9.0, 7.0, 1.0)
 
     # No detections -> None (becomes a tracking gap, never a fake point).
-    assert app._parse_roboflow_tail([{"out": {"predictions": []}}]) is None
-    print("OK: Roboflow parser — picks highest-confidence tail, name + index fallback, empty->None")
+    assert app._parse_roboflow_tail({"predictions": []}) is None
+    print("OK: Roboflow parser — real End-Point schema, 'tail' name override, empty->None")
 
 
 if __name__ == "__main__":

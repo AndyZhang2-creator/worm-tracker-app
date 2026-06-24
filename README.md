@@ -36,27 +36,44 @@ unset):
 | Backend | When used | Notes |
 |---------|-----------|-------|
 | `ultralytics` | default; or `WORM_BACKEND=ultralytics` | Local YOLO-pose weights at `model/best.pt`. The permanent backend. |
-| `roboflow` | auto when `ROBOFLOW_API_KEY` is set; or `WORM_BACKEND=roboflow` | **Temporary** Roboflow Inference *workflow* over HTTP. Each frame is JPEG+base64-posted to `{api_url}/infer/workflows/{workspace}/{workflow_id}`. |
+| `roboflow` | auto when `ROBOFLOW_API_KEY` is set; or `WORM_BACKEND=roboflow` | **Temporary** Roboflow detector. Each frame is JPEG+base64-posted to the hosted model and the tracked endpoint is read from the predictions. |
 
-Roboflow backend env vars (the API key is **never** committed to the repo):
+To use the temporary Roboflow detector, you only need an API key — it calls the
+trained model directly on Roboflow's hosted endpoint (no local server, no
+trained `best.pt`):
 
 ```bash
-export ROBOFLOW_API_KEY=...                      # required
-export ROBOFLOW_API_URL=http://localhost:9001    # default; or a hosted endpoint
-export ROBOFLOW_WORKSPACE=andy-zhang-ud8qm        # default
-export ROBOFLOW_WORKFLOW_ID=c-elegan-detection-v1-logic
-export WORM_BACKEND=roboflow                       # force it explicitly
+export ROBOFLOW_API_KEY=...        # required (kept out of git; set as a Space secret in prod)
+export WORM_BACKEND=roboflow        # optional — auto-on when the key is present
 ```
 
-To run a local Roboflow inference server: `pip install inference && inference
-server start` (listens on `:9001`). One HTTP round-trip per sampled frame, so it
-is slower than local weights — fine for short clips, and it's only temporary.
+Other Roboflow knobs (sensible defaults already point at this project's model):
 
-> The hosted (serverless) version of the workflow currently fails to compile
-> (`InnerWorkflowParameterBindingsUnknownInputError` on `model_id`). Until that's
-> fixed in the Roboflow workflow editor, use a local inference server. Use
-> `probe_roboflow.py` to dump the raw workflow response and confirm the keypoint
-> schema the parser expects.
+```bash
+export ROBOFLOW_MODEL_ID=c-elegan-detection-5haae/1   # direct model (default)
+export ROBOFLOW_API_URL=https://serverless.roboflow.com  # default in model mode
+export ROBOFLOW_TAIL_INDEX=1          # which endpoint to track (0 or 1)
+export ROBOFLOW_TAIL_KEYPOINT=tail    # ...or pick the endpoint by class name
+# To use a Roboflow *workflow* instead of the direct model, set:
+#   ROBOFLOW_MODEL_ID=""  ROBOFLOW_WORKFLOW_ID=...  ROBOFLOW_API_URL=http://localhost:9001
+```
+
+Notes:
+
+- **Direct model, not the workflow.** The published *workflow*
+  (`c-elegan-detection-v1-logic`) currently fails to compile on serverless
+  (`InnerWorkflowParameterBindingsUnknownInputError` on `model_id`). We sidestep
+  it by calling the underlying model (`c-elegan-detection-5haae/1`) directly,
+  which works hosted with just the API key. To run a local server instead:
+  `pip install inference && inference server start` (listens on `:9001`), then
+  set `ROBOFLOW_API_URL=http://localhost:9001`.
+- **Endpoints, not head/tail.** This model emits two keypoints named
+  `End-point1` (id 0) and `End-Point-2` (id 1), not head/tail. We track one
+  endpoint consistently (index 1 by default), which is all that speed and
+  displacement need. `probe_roboflow.py` dumps the raw response if you want to
+  re-confirm the schema.
+- One HTTP round-trip per sampled frame, so it's slower than local weights —
+  fine for short clips, and it's only the temporary stand-in until `best.pt`.
 
 ## Add your trained model
 
