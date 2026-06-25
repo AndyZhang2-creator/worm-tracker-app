@@ -159,7 +159,7 @@ LIVE_FRAME_EVERY_N = max(1, int(_float_env("WORM_LIVE_FRAME_EVERY_N", 1)))
 
 # Optional escape hatch for the older direct-model backend. The default is now
 # the serverless Roboflow workflow requested by the user.
-RF_MODEL_ID = os.environ.get("ROBOFLOW_MODEL_ID", "").strip()
+RF_MODEL_ID = os.environ.get("ROBOFLOW_MODEL_ID", "c-elegan-detection-5haae/6").strip()
 RF_FALLBACK_MODEL_ID = os.environ.get("ROBOFLOW_FALLBACK_MODEL_ID", "c-elegan-detection-5haae/6").strip()
 _RF_CLIENT = None
 
@@ -711,7 +711,10 @@ def _annotate_detection_frame(frame, candidates: list[dict]):
     muted_color = (132, 144, 152)
     endpoint_color = (61, 163, 232)
 
-    for det_i, candidate in enumerate(candidates or [], start=1):
+    # Candidates are sorted by confidence desc; only label the top worms so the
+    # live preview shows real worms, not the model's low-confidence noise.
+    shown = (candidates or [])[:MAX_WORMS_PER_VIDEO]
+    for det_i, candidate in enumerate(shown, start=1):
         keypoints = candidate.get("keypoints") or []
         center = _candidate_center(candidate)
         color = selected_color if det_i <= MAX_WORMS_PER_VIDEO else muted_color
@@ -753,7 +756,7 @@ def _live_frame_payload(frame, candidates: list[dict], frame_index: int, analyze
         "frame_index": int(frame_index),
         "analyzed_index": int(analyzed_index),
         "time_s": round(frame_index / native_fps, 3) if native_fps else None,
-        "detections": len(candidates or []),
+        "detections": min(len(candidates or []), MAX_WORMS_PER_VIDEO),
         "image": data_url,
     }
 
