@@ -8,11 +8,28 @@ Usage (key comes from the environment, never hard-coded):
     ROBOFLOW_API_KEY=xxxx ROBOFLOW_API_URL=http://localhost:9001 python probe_roboflow.py
 """
 import base64, json, os
+from pathlib import Path
 import cv2, numpy as np, httpx
+
+
+def _load_local_env(path):
+    if not path.exists():
+        return
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+_load_local_env(Path(__file__).resolve().parent / ".env")
 
 API_KEY = os.environ.get("ROBOFLOW_API_KEY", "")
 WORKSPACE = os.environ.get("ROBOFLOW_WORKSPACE", "andy-zhang-ud8qm")
-WORKFLOW = os.environ.get("ROBOFLOW_WORKFLOW_ID", "c-elegan-detection-v1-logic")
+WORKFLOW = os.environ.get("ROBOFLOW_WORKFLOW_ID", "c-elegan-detection-v6-logic")
+FALLBACK_MODEL = os.environ.get("ROBOFLOW_FALLBACK_MODEL_ID", "c-elegan-detection-5haae/6")
+CONFIDENCE = float(os.environ.get("ROBOFLOW_CONFIDENCE", "0.30"))
 LOCAL_URL = os.environ.get("ROBOFLOW_API_URL")  # set to probe a local server
 
 if not API_KEY:
@@ -27,7 +44,10 @@ b64 = base64.b64encode(buf).decode("utf-8")
 
 body = {
     "api_key": API_KEY,
-    "inputs": {"image": {"type": "base64", "value": b64}},
+    "inputs": {
+        "image": {"type": "base64", "value": b64},
+        "confidence": CONFIDENCE,
+    },
     "use_cache": True,
 }
 
@@ -42,7 +62,20 @@ for base in bases:
         r = httpx.post(url, json=body, timeout=60)
         print(f"\n=== {base}  HTTP {r.status_code} ===")
         if r.status_code != 200:
-            print(r.text[:600]); continue
+            print(r.text[:600])
+            if "InnerWorkflowParameterBindingsUnknownInputError" not in r.text:
+                continue
+            fallback_url = f"{base}/{FALLBACK_MODEL}"
+            rf = httpx.post(
+                fallback_url,
+                params={"api_key": API_KEY, "confidence": int(CONFIDENCE * 100)},
+                content=b64,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                timeout=60,
+            )
+            print(f"\n=== fallback {fallback_url}  HTTP {rf.status_code} ===")
+            print(rf.text[:3000])
+            break
         data = r.json()
         print("TOP-LEVEL TYPE:", type(data).__name__)
         print(json.dumps(data, indent=2)[:3000])

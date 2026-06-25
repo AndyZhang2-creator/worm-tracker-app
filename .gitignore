@@ -8,6 +8,7 @@ __pycache__/
 .venv/
 venv/
 env/
+.env
 
 # Trained model weights — NOT checked in (see README). Training happens
 # separately; drop best.pt into model/ locally.

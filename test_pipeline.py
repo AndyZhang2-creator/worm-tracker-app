@@ -10,8 +10,11 @@ algorithm end-to-end, batch error isolation, CSV building, and mm calibration.
 Run:  ./.venv/Scripts/python.exe test_pipeline.py
 """
 
+import base64
 import os
 import tempfile
+
+os.environ["WORM_BACKEND"] = "ultralytics"
 
 import cv2
 import numpy as np
@@ -89,8 +92,12 @@ def main():
     make_video(v30, native_fps=30.0, blob_step_px=4)
     make_video(v15, native_fps=15.0, blob_step_px=4)
 
-    r30 = app.analyze_video_file(v30, sample_fps=10.0, pcutoff=0.5, px_per_mm=None)
-    r15 = app.analyze_video_file(v15, sample_fps=10.0, pcutoff=0.5, px_per_mm=None)
+    r30_rows = app.analyze_video_file(v30, sample_fps=10.0, pcutoff=0.5, px_per_mm=None)
+    r15_rows = app.analyze_video_file(v15, sample_fps=10.0, pcutoff=0.5, px_per_mm=None)
+    assert len(r30_rows) == 1, r30_rows
+    assert len(r15_rows) == 1, r15_rows
+    r30 = r30_rows[0]
+    r15 = r15_rows[0]
 
     print(f"30fps clip: native={r30['native_fps']} eff={r30['effective_fps']} "
           f"avg={r30['avg_speed_px_s']} px/s  tracked={r30['frames_tracked_pct']}%")
@@ -113,6 +120,18 @@ def main():
     assert abs(r30["farthest_displacement_px"] - 156.0) < 6.0, r30["farthest_displacement_px"]
     assert abs(r30["net_displacement_px"] - 156.0) < 6.0, r30["net_displacement_px"]
     assert r30["farthest_displacement_time_s"] is not None
+    assert r30["per_second_speed"][0]["avg_speed_px_s"] == 120.0, r30["per_second_speed"]
+    assert r30["per_second_speed"][1]["avg_speed_px_s"] == 120.0, r30["per_second_speed"]
+    assert r30["per_second_speed"][1]["tracked_duration_s"] == 0.3, r30["per_second_speed"]
+    assert len(r15["per_second_speed"]) == 3, r15["per_second_speed"]
+    assert r15["per_second_speed"][2]["avg_speed_px_s"] == 60.0, r15["per_second_speed"]
+    assert r30["tracking_frame_image"].startswith("data:image/jpeg;base64,"), r30.keys()
+    assert r30["tracking_frame_index"] == 0
+    assert r30["tracking_frame_analyzed_index"] == 0
+    assert r30["tracking_frame_time_s"] == 0.0
+    preview_bytes = base64.b64decode(r30["tracking_frame_image"].split(",", 1)[1])
+    assert len(preview_bytes) > 1000
+    print("OK: labeled tracking-frame preview returned with worm result")
     # Both worm endpoints are tracked; one is auto-selected as "the farthest".
     assert len(r30["endpoints"]) == 2, r30["endpoints"]
     assert r30["tracked_endpoint_index"] in (0, 1)
@@ -121,7 +140,7 @@ def main():
           f"(tracked endpoint #{r30['tracked_endpoint_index']} of {len(r30['endpoints'])})")
 
     # Calibration switches units.
-    rc = app.analyze_video_file(v30, sample_fps=10.0, pcutoff=0.5, px_per_mm=10.0)
+    rc = app.analyze_video_file(v30, sample_fps=10.0, pcutoff=0.5, px_per_mm=10.0)[0]
     assert abs(rc["avg_speed_mm_s"] - 12.0) < 0.3, rc["avg_speed_mm_s"]
     assert abs(rc["farthest_displacement_mm"] - 15.6) < 0.6, rc["farthest_displacement_mm"]
     print(f"OK: calibration px_per_mm=10 -> avg {rc['avg_speed_mm_s']} mm/s, "
@@ -134,8 +153,7 @@ def main():
     results = []
     for p in (v30, bad, v15):
         try:
-            res = app.analyze_video_file(p, 10.0, 0.5, None)
-            results.append(res)
+            results.extend(app.analyze_video_file(p, 10.0, 0.5, None))
         except Exception as exc:  # noqa: BLE001
             results.append({"video": os.path.basename(p), "error": str(exc)})
     assert "error" not in results[0] and "error" in results[1] and "error" not in results[2]
@@ -147,6 +165,7 @@ def main():
     # mean of the two per-video averages (~120 and ~60) -> ~90 px/s.
     assert abs(summary["avg_speed"] - 90.0) < 3.0, summary["avg_speed"]
     assert summary["farthest_displacement_video"] in ("clip30fps.mp4", "clip15fps.mp4")
+    assert summary["farthest_displacement_worm_id"] == 1
     print(f"OK: batch summary — {summary['videos_ok']} worms, avg "
           f"{summary['avg_speed']} px/s, farthest {summary['farthest_displacement']}px "
           f"in {summary['farthest_displacement_video']}")
@@ -154,11 +173,15 @@ def main():
     # CSV building (pixels + mm variants), now including displacement columns.
     csv_px = app._build_csv(results, used_calibration=False)
     csv_mm = app._build_csv([rc], used_calibration=True)
-    assert csv_px.splitlines()[0] == ",".join(app.CSV_BASE_COLUMNS)
+    header_px = csv_px.splitlines()[0]
+    header_mm = csv_mm.splitlines()[0]
+    assert header_px.startswith(",".join(app.CSV_BASE_COLUMNS))
     assert "farthest_displacement_px" in csv_px.splitlines()[0]
+    assert "second_0_1_avg_speed_px_s" in header_px
+    assert "second_2_3_avg_speed_px_s" in header_px
     assert "broken.mp4" in csv_px
-    assert csv_mm.splitlines()[0].endswith("net_displacement_mm")
-    print("OK: CSV header + rows correct (px and mm variants, incl. displacement)")
+    assert "second_0_1_avg_speed_mm_s" in header_mm
+    print("OK: CSV header + rows correct (px and mm variants, incl. displacement + per-second speeds)")
     print("\nCSV preview (pixels):")
     print(csv_px.strip())
 
@@ -205,6 +228,44 @@ def test_roboflow_parser():
     # No detections -> None (becomes a tracking gap, never a fake point).
     assert app._parse_roboflow_keypoints({"predictions": []}) is None
     print("OK: Roboflow parser — returns all endpoints of the best detection")
+
+    def cand(cx, conf, label):
+        return {
+            "x": cx,
+            "y": 100,
+            "confidence": conf,
+            "class": label,
+            "keypoints": [
+                (cx - 5, 100.0, conf, "End-point1"),
+                (cx + 5, 100.0, conf, "End-Point-2"),
+            ],
+        }
+
+    same_worm_track = app._select_same_worm_track([
+        [cand(100, 0.90, "seed-worm"), cand(300, 0.60, "other-worm")],
+        [cand(112, 0.35, "seed-worm"), cand(300, 0.99, "other-worm")],
+    ])
+    assert same_worm_track[1][0][0] == 107.0, same_worm_track
+    print("OK: same-worm tracking — nearest center beats per-frame confidence jump")
+
+    seeded = [cand(100 + i * 40, 0.90 - i * 0.05, f"seed-{i}") for i in range(5)]
+    lower_seed = cand(340, 0.10, "not-seeded")
+    later = [cand(104 + i * 40, 0.40, f"seed-{i}") for i in range(5)]
+    tempting_intruder = cand(340, 0.99, "not-seeded")
+    five_tracks = app._select_same_worm_tracks([
+        seeded + [lower_seed],
+        later + [tempting_intruder],
+    ], max_tracks=5)
+    assert len(five_tracks) == 5, five_tracks
+    assert [t["worm_id"] for t in five_tracks] == [1, 2, 3, 4, 5]
+    assert [t["seed_confidence"] for t in five_tracks] == [0.9, 0.85, 0.8, 0.75, 0.7]
+    assert [t["frames"][1][0][0] for t in five_tracks] == [99.0, 139.0, 179.0, 219.0, 259.0]
+    no_jump_tracks = app._select_same_worm_tracks([
+        [cand(100, 0.90, "seed")],
+        [cand(400, 0.99, "far-intruder")],
+    ], max_tracks=1)
+    assert no_jump_tracks[0]["frames"][1] is None, no_jump_tracks
+    print("OK: top-five worm tracking — seeded five identities ignore later intruder")
 
     # Endpoint selection: default picks the greatest-displacement endpoint;
     # an untracked (None) endpoint never wins over a tracked one.

@@ -139,6 +139,15 @@
   #chartTitle { font-size: 14px; font-weight: 600; margin: 0 0 4px; }
   #chartMeta { font-size: 12px; color: var(--muted); margin: 0 0 14px; font-family: var(--mono); }
   canvas { width: 100%; display: block; background: #101316; border: 1px solid var(--border); border-radius: 8px; }
+  #secondBins { margin-top: 14px; overflow-x: auto; }
+  #secondBins table { font-size: 12px; }
+  .detail-grid { display: grid; grid-template-columns: minmax(260px, 0.9fr) minmax(420px, 1.4fr); gap: 20px; align-items: start; }
+  #trackingFrameTitle { font-size: 14px; font-weight: 600; margin: 0 0 4px; }
+  #trackingFrameMeta { font-size: 12px; color: var(--muted); margin: 0 0 14px; font-family: var(--mono); }
+  #trackingFrameImg { width: 100%; display: block; background: #101316; border: 1px solid var(--border); border-radius: 8px; }
+  @media (max-width: 900px) {
+    .detail-grid { grid-template-columns: 1fr; }
+  }
 
   .empty { color: var(--muted); font-size: 13px; padding: 8px 0; }
 
@@ -181,7 +190,7 @@
     </div>
     <div class="field">
       <label for="pcutoff">pcutoff</label>
-      <input type="number" id="pcutoff" value="0.5" min="0" max="1" step="0.05" />
+      <input type="number" id="pcutoff" value="0.3" min="0" max="1" step="0.05" />
     </div>
     <div class="field">
       <label for="pxPerMm">px_per_mm (optional)</label>
@@ -210,6 +219,7 @@
     <thead>
       <tr>
         <th>Video</th>
+        <th class="num">Worm</th>
         <th class="num">% tracked</th>
         <th class="num" id="hAvg">avg (px/s)</th>
         <th class="num" id="hMax">max (px/s)</th>
@@ -224,9 +234,19 @@
 
 <!-- Chart -->
 <div class="panel" id="chartPanel">
-  <p id="chartTitle"></p>
-  <p id="chartMeta"></p>
-  <canvas id="chart" width="900" height="320"></canvas>
+  <div class="detail-grid">
+    <div id="trackingFrameWrap">
+      <p id="trackingFrameTitle"></p>
+      <p id="trackingFrameMeta"></p>
+      <img id="trackingFrameImg" alt="Labeled tracking frame" />
+    </div>
+    <div>
+      <p id="chartTitle"></p>
+      <p id="chartMeta"></p>
+      <canvas id="chart" width="900" height="320"></canvas>
+      <div id="secondBins"></div>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -243,6 +263,8 @@
   const resultsPanel = $("resultsPanel");
   const resultsBody = $("resultsBody");
   const chartPanel = $("chartPanel");
+  const trackingFrameWrap = $("trackingFrameWrap");
+  const trackingFrameImg = $("trackingFrameImg");
 
   let chosenFiles = [];   // File[]
   let lastResults = [];   // result objects from the backend
@@ -329,7 +351,7 @@
 
     const fd = new FormData();
     const sampleFps = $("sampleFps").value || "10";
-    const pcutoff = $("pcutoff").value || "0.5";
+    const pcutoff = $("pcutoff").value || "0.3";
     const pxPerMm = $("pxPerMm").value.trim();
     usesMm = pxPerMm !== "";
 
@@ -387,7 +409,7 @@
         tr.className = "row-error";
         tr.innerHTML =
           "<td>" + escapeHtml(r.video || "unknown") + "</td>" +
-          '<td class="num" colspan="6">error: ' + escapeHtml(r.error) + "</td>";
+          '<td class="num" colspan="7">error: ' + escapeHtml(r.error) + "</td>";
       } else {
         const avg = usesMm ? r.avg_speed_mm_s : r.avg_speed_px_s;
         const max = usesMm ? r.max_speed_mm_s : r.max_speed_px_s;
@@ -397,6 +419,7 @@
         tr.dataset.idx = idx;
         tr.innerHTML =
           "<td>" + escapeHtml(r.video) + "</td>" +
+          '<td class="num">' + escapeHtml(r.worm_id || "—") + "</td>" +
           '<td class="num">' + fmt(r.frames_tracked_pct) + "</td>" +
           '<td class="num">' + fmt(avg) + "</td>" +
           '<td class="num">' + fmt(max) + "</td>" +
@@ -418,7 +441,10 @@
     $("sAvg").textContent = (s.avg_speed === null ? "—" : Number(s.avg_speed).toFixed(2)) + " " + s.units_speed;
     $("sFar").textContent = (s.farthest_displacement === null ? "—" : Number(s.farthest_displacement).toFixed(2)) + " " + s.units_distance;
     let note = "";
-    if (s.farthest_displacement_video) note += "farthest tail reached in " + s.farthest_displacement_video;
+    if (s.farthest_displacement_video) {
+      note += "farthest tail reached in " + s.farthest_displacement_video;
+      if (s.farthest_displacement_worm_id) note += " worm " + s.farthest_displacement_worm_id;
+    }
     if (s.videos_failed) note += (note ? " · " : "") + s.videos_failed + " video(s) failed";
     $("sNote").textContent = note;
   }
@@ -429,10 +455,54 @@
     drawChart(lastResults[idx]);
   }
 
+  function renderSecondBins(r) {
+    const bins = r.per_second_speed || [];
+    const wrap = $("secondBins");
+    if (!bins.length) {
+      wrap.innerHTML = "";
+      return;
+    }
+
+    const rows = bins.map((bin) => {
+      const avg = usesMm ? bin.avg_speed_mm_s : bin.avg_speed_px_s;
+      return "<tr>" +
+        '<td class="num">' + Number(bin.start_s).toFixed(1) + "-" + Number(bin.end_s).toFixed(1) + "s</td>" +
+        '<td class="num">' + fmt(avg) + "</td>" +
+        '<td class="num">' + fmt(bin.tracked_duration_s) + "</td>" +
+      "</tr>";
+    }).join("");
+
+    wrap.innerHTML =
+      "<table><thead><tr>" +
+      '<th class="num">second</th>' +
+      '<th class="num">avg (' + unitSpeed() + ")</th>" +
+      '<th class="num">tracked s</th>' +
+      "</tr></thead><tbody>" + rows + "</tbody></table>";
+  }
+
+  function renderTrackingFrame(r) {
+    if (!r.tracking_frame_image) {
+      trackingFrameWrap.style.display = "none";
+      trackingFrameImg.removeAttribute("src");
+      return;
+    }
+
+    trackingFrameWrap.style.display = "block";
+    $("trackingFrameTitle").textContent = r.video + " | worm " + (r.worm_id || "n/a");
+    $("trackingFrameMeta").textContent =
+      "frame " + (r.tracking_frame_index ?? "n/a") +
+      " | analyzed " + (r.tracking_frame_analyzed_index ?? "n/a") +
+      " | " + fmt(r.tracking_frame_time_s) + "s" +
+      " | seed conf " + fmt(r.seed_confidence);
+    trackingFrameImg.src = r.tracking_frame_image;
+  }
+
   // ---- Hand-drawn speed-over-time chart (no libraries) -------------------- //
   function drawChart(r) {
     chartPanel.style.display = "block";
-    $("chartTitle").textContent = r.video;
+    renderTrackingFrame(r);
+    renderSecondBins(r);
+    $("chartTitle").textContent = r.video + " · worm " + (r.worm_id || "—");
     const far = usesMm ? r.farthest_displacement_mm : r.farthest_displacement_px;
     const epName = r.tracked_endpoint_name || ("#" + r.tracked_endpoint_index);
     $("chartMeta").textContent =

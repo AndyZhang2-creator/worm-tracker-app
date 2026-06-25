@@ -29,54 +29,62 @@ pip install -r requirements.txt
 
 ## Detection backends
 
-The app gets a per-frame tail `(x, y, confidence)` from one of two
-interchangeable backends, chosen by the `WORM_BACKEND` env var (auto-detected if
-unset):
+The app gets per-frame worm candidates from one of two interchangeable backends,
+chosen by the `WORM_BACKEND` env var (auto-detected if unset):
 
 | Backend | When used | Notes |
 |---------|-----------|-------|
 | `ultralytics` | default; or `WORM_BACKEND=ultralytics` | Local YOLO-pose weights at `model/best.pt`. The permanent backend. |
-| `roboflow` | auto when `ROBOFLOW_API_KEY` is set; or `WORM_BACKEND=roboflow` | **Temporary** Roboflow detector. Each frame is JPEG+base64-posted to the hosted model and the tracked endpoint is read from the predictions. |
+| `roboflow` | auto when `ROBOFLOW_API_KEY` is set; or `WORM_BACKEND=roboflow` | Hosted Roboflow workflow `andy-zhang-ud8qm/c-elegan-detection-v6-logic`. The app uses `InferenceHTTPClient.run_workflow` when the optional SDK is available, with an HTTP fallback for Python versions the SDK does not support. If Roboflow returns the known workflow `model_id` compile error or times out, the app falls back to direct model `c-elegan-detection-5haae/6`. |
 
-To use the temporary Roboflow detector, you only need an API key — it calls the
-trained model directly on Roboflow's hosted endpoint (no local server, no
-trained `best.pt`):
+To use the Roboflow workflow, set an API key in `.env` locally or as a Space
+secret in production:
 
 ```bash
-export ROBOFLOW_API_KEY=...        # required (kept out of git; set as a Space secret in prod)
-export WORM_BACKEND=roboflow        # optional — auto-on when the key is present
+ROBOFLOW_API_KEY=...
+WORM_BACKEND=roboflow
 ```
 
 Other Roboflow knobs (sensible defaults already point at this project's model):
 
 ```bash
-export ROBOFLOW_MODEL_ID=c-elegan-detection-5haae/5   # direct model (default)
-export ROBOFLOW_API_URL=https://serverless.roboflow.com  # default in model mode
-export WORM_ENDPOINT_INDEX=0          # pin a specific endpoint (0 or 1) instead of auto
-export ROBOFLOW_TAIL_KEYPOINT=tail    # ...or pin the endpoint by class name
-# To use a Roboflow *workflow* instead of the direct model, set:
-#   ROBOFLOW_MODEL_ID=""  ROBOFLOW_WORKFLOW_ID=...  ROBOFLOW_API_URL=http://localhost:9001
+ROBOFLOW_WORKSPACE=andy-zhang-ud8qm
+ROBOFLOW_WORKFLOW_ID=c-elegan-detection-v6-logic
+ROBOFLOW_API_URL=https://serverless.roboflow.com
+ROBOFLOW_CONFIDENCE=0.30      # minimum detection/keypoint confidence
+ROBOFLOW_WORKFLOW_TIMEOUT_S=15
+ROBOFLOW_MODEL_TIMEOUT_S=120
+ROBOFLOW_FALLBACK_MODEL_ID=c-elegan-detection-5haae/6
+WORM_PCUTOFF=0.30             # low-confidence keypoints become tracking gaps
+WORM_MAX_TRACKS=5             # seed and track up to five worms per video
+WORM_MAX_MATCH_DISTANCE_PX=150  # far detections become gaps instead of swaps
+WORM_TRACKING_FRAME_MAX_WIDTH=900  # max width of the labeled preview image
+WORM_ENDPOINT_INDEX=0         # pin a specific endpoint (0 or 1) instead of auto
+ROBOFLOW_TAIL_KEYPOINT=tail   # ...or pin the endpoint by class name
 ```
 
 Notes:
 
-- **Direct model, not the workflow.** The published *workflows*
-  (`c-elegan-detection-v1-logic`, `-v5-logic`) currently fail to compile on
-  serverless (`InnerWorkflowParameterBindingsUnknownInputError` on `model_id`).
-  We sidestep
-  it by calling the underlying model (`c-elegan-detection-5haae/5`) directly,
-  which works hosted with just the API key. To run a local server instead:
-  `pip install inference && inference server start` (listens on `:9001`), then
-  set `ROBOFLOW_API_URL=http://localhost:9001`.
+- **Workflow first, direct model only on known compile error.** The app is
+  configured for the requested v6 workflow. If Roboflow serverless returns the
+  `InnerWorkflowParameterBindingsUnknownInputError` seen in older workflow
+  versions, or if serverless times out, the app falls back to the underlying v6
+  direct model with the same 30% confidence threshold so analysis still works.
+- **Same worms across frames.** Roboflow can return multiple worm detections in
+  one frame. The app seeds the five most confident worms from the first frame
+  with detections, then associates later detections one-to-one by nearest center
+  so each reported row follows the same worm identity. Distant unmatched
+  detections become gaps instead of replacing one of the seeded worms.
 - **Endpoints, not head/tail.** This model emits two keypoints named
   `End-point1` (id 0) and `End-Point-2` (id 1), not head/tail. The two ends of a
-  worm move differently, so by default the app tracks **both** and reports
+  worm move differently, so after choosing each seeded worm, the app tracks
+  **both** endpoints on that worm and reports
   whichever moved farthest from its start ("the farthest tail"); each video's
   response includes an `endpoints` breakdown with both. Pin a specific end with
   `WORM_ENDPOINT_INDEX=0|1` or `ROBOFLOW_TAIL_KEYPOINT=<name>`.
   `probe_roboflow.py` dumps the raw response if you want to re-confirm the schema.
-- One HTTP round-trip per sampled frame, so it's slower than local weights —
-  fine for short clips, and it's only the temporary stand-in until `best.pt`.
+- One HTTP round-trip per sampled frame, so hosted workflow inference is slower
+  than local weights.
 
 ## Add your trained model
 
@@ -113,21 +121,34 @@ Then open <http://localhost:8000>.
      inference on. Higher = more accurate but slower; 10/sec is a reasonable
      default for a 20-second clip. The video's native fps is read per-video, so
      mixing clips with different frame rates in one batch is fine.
-   - **pcutoff** (default `0.5`) — keypoint confidence below this is treated as
+   - **pcutoff** (default `0.3`) — keypoint confidence below this is treated as
      *untracked* (a gap), not as zero movement (see "Why gaps" below).
    - **px_per_mm** (optional) — leave blank to stay in pixels; set it to convert
      every speed/distance to millimetres.
 3. Click **Analyze**. A summary banner shows the headline numbers, results
-   appear in a table, and clicking any row draws that video's speed-over-time
-   chart (with an amber marker at the moment the tail was farthest from start).
-4. After a batch run, **Download CSV** exports the summary table.
+   appear in a table, and clicking any row shows the labeled tracking frame for
+   that worm, draws that video's speed-over-time chart, shows a one-second
+   average-speed table, and adds an amber marker at the moment the tail was
+   farthest from start.
+4. After a batch run, **Download CSV** exports one row per worm/video, including
+   per-second average speed columns.
 
 ### Metrics reported
 
-Per video (and as CSV columns):
+Per tracked worm (and as CSV columns):
 
 - **avg / max speed** — the average and peak tail speed (px/s, or mm/s if
   calibrated). The average is the headline "how fast the worm is moving".
+- **worm_id** — identity number seeded by confidence, up to five per video.
+- **per-second speed** (`per_second_speed`) — one-second bins for each tracked
+  worm, each with `avg_speed_px_s` and the amount of tracked time in that
+  second. The CSV exports these as columns such as
+  `second_0_1_avg_speed_px_s`, `second_1_2_avg_speed_px_s`, etc.; calibrated
+  runs also include matching `*_mm_s` columns.
+- **tracking frame** (`tracking_frame_image`) - a JPEG data URL of the seed
+  frame with the tracked worms labeled. The selected row's worm is highlighted
+  in the browser so the picture and the speed numbers refer to the same seeded
+  identity.
 - **farthest tail** (`farthest_displacement`) — the maximum straight-line
   distance the tracked endpoint ever reached from its **first tracked
   position**: how far that end of the worm got from where it started. By default
@@ -165,8 +186,8 @@ Both corrupt the data. The only correct behavior is to skip the interval. See
 
 | Method | Path                   | Purpose                                    |
 |--------|------------------------|--------------------------------------------|
-| POST   | `/api/analyze`         | Analyze one video.                         |
-| POST   | `/api/analyze-batch`   | Analyze many videos; returns a `csv_token`.|
+| POST   | `/api/analyze`         | Analyze one video; returns a `worms` array.|
+| POST   | `/api/analyze-batch`   | Analyze many videos; returns flattened worm rows and a `csv_token`.|
 | GET    | `/api/download/{token}`| Download the batch summary CSV.            |
 | GET    | `/api/model-status`    | `{ "ready": true }` or a reason it isn't.  |
 

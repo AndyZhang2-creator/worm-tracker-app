@@ -5,3 +5,4 @@ opencv-python-headless
 numpy
 httpx
 ultralytics
+inference-sdk; python_version < "3.13"
