@@ -151,6 +151,10 @@ RF_MODEL_TIMEOUT_S = _float_env("ROBOFLOW_MODEL_TIMEOUT_S", 120.0)
 DEFAULT_PCUTOFF = _float_env("WORM_PCUTOFF", RF_CONFIDENCE)
 MAX_WORMS_PER_VIDEO = max(1, int(_float_env("WORM_MAX_TRACKS", 5)))
 MAX_MATCH_DISTANCE_PX = _float_env("WORM_MAX_MATCH_DISTANCE_PX", 150.0)
+# Overlap tolerance for de-duplicating the model's boxes: if two detections
+# overlap by more than this fraction of the smaller box, keep only the most
+# confident one. Adjustable per request; 0.9 = merge boxes overlapping >90%.
+DEFAULT_OVERLAP_TOLERANCE = min(1.0, max(0.0, _float_env("WORM_OVERLAP_TOLERANCE", 0.9)))
 TRACKING_FRAME_MAX_WIDTH = max(320, int(_float_env("WORM_TRACKING_FRAME_MAX_WIDTH", 900)))
 TRACKING_FRAME_JPEG_QUALITY = min(95, max(50, int(_float_env("WORM_TRACKING_FRAME_JPEG_QUALITY", 85))))
 LIVE_FRAME_MAX_WIDTH = max(320, int(_float_env("WORM_LIVE_FRAME_MAX_WIDTH", 720)))
@@ -368,6 +372,60 @@ def _candidate_center(candidate: dict):
     return float(np.mean(xs)), float(np.mean(ys))
 
 
+def _candidate_box(candidate: dict):
+    """(x1, y1, x2, y2) box for a candidate; falls back to its keypoint extent."""
+    x, y = candidate.get("x"), candidate.get("y")
+    w, h = candidate.get("width"), candidate.get("height")
+    if x is not None and y is not None and w and h:
+        return (float(x) - w / 2, float(y) - h / 2, float(x) + w / 2, float(y) + h / 2)
+    kps = candidate.get("keypoints") or []
+    xs = [k[0] for k in kps if not np.isnan(k[0])]
+    ys = [k[1] for k in kps if not np.isnan(k[1])]
+    if not xs or not ys:
+        return None
+    pad = 4.0  # give single/colinear keypoints a small footprint
+    return (min(xs) - pad, min(ys) - pad, max(xs) + pad, max(ys) + pad)
+
+
+def _box_overlap_ratio(a, b) -> float:
+    """
+    Overlap as a fraction of the SMALLER box (intersection / min-area). This
+    reads as "these two boxes overlap by X%" and catches one box nested inside
+    another — the usual signature of the model detecting the same worm twice.
+    """
+    if a is None or b is None:
+        return 0.0
+    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+    inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+    if inter <= 0:
+        return 0.0
+    area_a = max(0.0, a[2] - a[0]) * max(0.0, a[3] - a[1])
+    area_b = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
+    smaller = min(area_a, area_b)
+    return inter / smaller if smaller > 0 else 0.0
+
+
+def _dedupe_overlapping(candidates: list[dict], tolerance: float):
+    """
+    Greedy NMS: walking highest-confidence first, drop any detection that
+    overlaps an already-kept one by more than `tolerance` (0..1). So when boxes
+    overlap a lot (default >90%), only the most-confident worm survives.
+    tolerance >= 1 (or <= 0) disables the filter.
+    """
+    if not candidates or tolerance is None or tolerance <= 0 or tolerance >= 1:
+        return candidates
+    ordered = sorted(candidates, key=lambda c: _safe_float(c.get("confidence"), 0.0), reverse=True)
+    kept, kept_boxes = [], []
+    for candidate in ordered:
+        box = _candidate_box(candidate)
+        if any(_box_overlap_ratio(box, kb) > tolerance for kb in kept_boxes):
+            continue
+        kept.append(candidate)
+        kept_boxes.append(box)
+    return kept
+
+
 def _parse_roboflow_detections(data):
     """
     Return every worm detection at or above RF_CONFIDENCE, sorted by confidence.
@@ -397,6 +455,8 @@ def _parse_roboflow_detections(data):
         candidate = {
             "x": pred.get("x"),
             "y": pred.get("y"),
+            "width": pred.get("width"),
+            "height": pred.get("height"),
             "confidence": det_conf,
             "class": pred.get("class_name", pred.get("class", "")),
             "keypoints": kps,
@@ -424,12 +484,12 @@ def _roboflow_unconfigured_detail() -> str:
     )
 
 
-def make_detector():
+def make_detector(overlap_tolerance: float = DEFAULT_OVERLAP_TOLERANCE):
     """
     Build a `frame -> list[candidate]` callable for the active backend. Each
-    candidate is one worm detection with all of its keypoints. Raises
-    HTTPException(503) if that backend isn't ready, so callers get the same
-    clean 503 either way.
+    candidate is one worm detection with all of its keypoints, after dropping
+    boxes that overlap an already-kept one by more than `overlap_tolerance`.
+    Raises HTTPException(503) if that backend isn't ready.
     """
     backend = active_backend()
     if backend == "roboflow":
@@ -437,14 +497,18 @@ def make_detector():
             raise HTTPException(status_code=503, detail=_roboflow_unconfigured_detail())
 
         def detect(frame):
-            return _parse_roboflow_detections(_roboflow_infer(frame))
+            return _dedupe_overlapping(
+                _parse_roboflow_detections(_roboflow_infer(frame)), overlap_tolerance
+            )
 
         return detect
 
     model = get_model()  # may raise HTTPException(503)
 
     def detect(frame):
-        return _extract_worm_candidates(model(frame, verbose=False)[0])
+        return _dedupe_overlapping(
+            _extract_worm_candidates(model(frame, verbose=False)[0]), overlap_tolerance
+        )
 
     return detect
 
@@ -476,6 +540,10 @@ def _extract_worm_candidates(result):
         box_confs = boxes.conf.cpu().numpy()
     else:
         box_confs = np.ones((xy_all.shape[0],), dtype=float)
+    try:
+        box_wh = boxes.xywh.cpu().numpy() if boxes is not None and boxes.xywh is not None else None
+    except Exception:  # noqa: BLE001
+        box_wh = None
 
     candidates = []
     for det_i in range(xy_all.shape[0]):
@@ -496,6 +564,8 @@ def _extract_worm_candidates(result):
         candidate = {
             "x": float(np.mean(xy[:, 0])),
             "y": float(np.mean(xy[:, 1])),
+            "width": float(box_wh[det_i][2]) if box_wh is not None and det_i < len(box_wh) else None,
+            "height": float(box_wh[det_i][3]) if box_wh is not None and det_i < len(box_wh) else None,
             "confidence": det_conf,
             "class": "worm",
             "keypoints": keypoints,
@@ -1069,14 +1139,14 @@ def _analyze_worm_track(
     }
 
 
-def analyze_video_file(path: str, sample_fps: float, pcutoff: float, px_per_mm, progress_callback=None):
+def analyze_video_file(path: str, sample_fps: float, pcutoff: float, px_per_mm, progress_callback=None, overlap_tolerance: float = DEFAULT_OVERLAP_TOLERANCE):
     """
     Run inference over one video and return one result dict per tracked worm.
 
     Raises ValueError for un-openable / non-video files so callers can decide
     whether to abort (single) or record a per-video error (batch).
     """
-    detect = make_detector()  # backend-agnostic; may raise HTTPException(503)
+    detect = make_detector(overlap_tolerance)  # backend-agnostic; may raise HTTPException(503)
 
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
@@ -1354,10 +1424,11 @@ async def analyze(
     sample_fps: float = Form(10.0),
     pcutoff: float = Form(DEFAULT_PCUTOFF),
     px_per_mm: float | None = Form(None),
+    overlap_tolerance: float = Form(DEFAULT_OVERLAP_TOLERANCE),
 ):
     tmp_path = _save_upload_to_temp(file)
     try:
-        results = analyze_video_file(tmp_path, sample_fps, pcutoff, px_per_mm)
+        results = analyze_video_file(tmp_path, sample_fps, pcutoff, px_per_mm, overlap_tolerance=overlap_tolerance)
         # Preserve the original uploaded filename rather than the temp name.
         for result in results:
             result["video"] = file.filename or result["video"]
@@ -1374,12 +1445,13 @@ async def analyze_batch(
     sample_fps: float = Form(10.0),
     pcutoff: float = Form(DEFAULT_PCUTOFF),
     px_per_mm: float | None = Form(None),
+    overlap_tolerance: float = Form(DEFAULT_OVERLAP_TOLERANCE),
 ):
     results: list[dict] = []
     for upload in files:
         tmp_path = _save_upload_to_temp(upload)
         try:
-            video_results = analyze_video_file(tmp_path, sample_fps, pcutoff, px_per_mm)
+            video_results = analyze_video_file(tmp_path, sample_fps, pcutoff, px_per_mm, overlap_tolerance=overlap_tolerance)
             for res in video_results:
                 res["video"] = upload.filename or res["video"]
                 results.append(res)
@@ -1412,6 +1484,7 @@ async def analyze_stream(
     sample_fps: float = Form(10.0),
     pcutoff: float = Form(DEFAULT_PCUTOFF),
     px_per_mm: float | None = Form(None),
+    overlap_tolerance: float = Form(DEFAULT_OVERLAP_TOLERANCE),
 ):
     jobs = []
     for upload in files:
@@ -1448,6 +1521,7 @@ async def analyze_stream(
                             pcutoff=pcutoff,
                             px_per_mm=px_per_mm,
                             progress_callback=progress,
+                            overlap_tolerance=overlap_tolerance,
                         )
                         for res in video_results:
                             res["video"] = name

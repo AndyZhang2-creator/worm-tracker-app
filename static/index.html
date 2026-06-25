@@ -207,6 +207,10 @@
       <label for="pxPerMm">px_per_mm (optional)</label>
       <input type="number" id="pxPerMm" placeholder="blank = pixels" min="0" step="0.1" />
     </div>
+    <div class="field">
+      <label for="overlapTol">overlap tolerance</label>
+      <input type="number" id="overlapTol" value="0.9" min="0" max="1" step="0.05" title="If two boxes overlap by more than this fraction, keep only the higher-confidence one. 1 = off." />
+    </div>
   </div>
   <div class="actions">
     <button id="analyzeBtn" disabled>Analyze</button>
@@ -390,8 +394,10 @@
     const pxPerMm = $("pxPerMm").value.trim();
     usesMm = pxPerMm !== "";
 
+    const overlapTol = $("overlapTol").value || "0.9";
     fd.append("sample_fps", sampleFps);
     fd.append("pcutoff", pcutoff);
+    fd.append("overlap_tolerance", overlapTol);
     if (usesMm) fd.append("px_per_mm", pxPerMm);
 
     // Always use the batch endpoint so we get a CSV token and uniform handling,

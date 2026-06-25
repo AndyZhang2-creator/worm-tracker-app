@@ -207,8 +207,23 @@ def main():
 
     # ---- Roboflow workflow parser (offline, mocked response) ---------------- #
     test_roboflow_parser()
+    test_overlap_dedupe()
 
     print("\nALL OFFLINE PIPELINE TESTS PASSED")
+
+
+def test_overlap_dedupe():
+    """Overlapping boxes collapse to the highest-confidence one; tol=1 disables."""
+    c_hi = {"x": 100, "y": 100, "width": 40, "height": 40, "confidence": 0.9,
+            "keypoints": [(90, 100, 0.9, "End-point1"), (110, 100, 0.9, "End-Point-2")]}
+    c_dup = {"x": 102, "y": 101, "width": 40, "height": 40, "confidence": 0.5,
+             "keypoints": [(92, 101, 0.5, "End-point1"), (112, 101, 0.5, "End-Point-2")]}
+    c_far = {"x": 400, "y": 400, "width": 40, "height": 40, "confidence": 0.7,
+             "keypoints": [(390, 400, 0.7, "End-point1"), (410, 400, 0.7, "End-Point-2")]}
+    kept = app._dedupe_overlapping([c_hi, c_dup, c_far], 0.9)
+    assert [c["confidence"] for c in kept] == [0.9, 0.7], kept
+    assert len(app._dedupe_overlapping([c_hi, c_dup, c_far], 1.0)) == 3  # disabled
+    print("OK: overlap dedup — keeps highest-confidence of overlapping boxes, tol=1 off")
 
 
 def test_roboflow_parser():
