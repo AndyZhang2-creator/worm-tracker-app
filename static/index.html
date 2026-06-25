@@ -148,6 +148,17 @@
   @media (max-width: 900px) {
     .detail-grid { grid-template-columns: 1fr; }
   }
+  #livePanel { display: none; }
+  .live-grid { display: grid; grid-template-columns: minmax(280px, 0.9fr) minmax(260px, 1fr); gap: 20px; align-items: start; }
+  #liveFrameImg { width: 100%; display: block; background: #101316; border: 1px solid var(--border); border-radius: 8px; min-height: 180px; object-fit: contain; }
+  #liveStatus { font-size: 14px; font-weight: 600; margin: 0 0 4px; }
+  #liveMeta { font-size: 12px; color: var(--muted); margin: 0 0 14px; font-family: var(--mono); }
+  .progress-track { height: 8px; background: #101316; border: 1px solid var(--border); border-radius: 999px; overflow: hidden; }
+  #liveProgressBar { height: 100%; width: 0%; background: var(--accent); transition: width 0.12s ease; }
+  .live-stats { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin-top: 16px; }
+  @media (max-width: 900px) {
+    .live-grid { grid-template-columns: 1fr; }
+  }
 
   .empty { color: var(--muted); font-size: 13px; padding: 8px 0; }
 
@@ -200,6 +211,22 @@
   <div class="actions">
     <button id="analyzeBtn" disabled>Analyze</button>
     <a id="downloadBtn" class="dl" style="display:none" href="#">Download CSV</a>
+  </div>
+</div>
+
+<!-- Live model preview -->
+<div class="panel" id="livePanel">
+  <div class="live-grid">
+    <img id="liveFrameImg" alt="Live model detection preview" />
+    <div>
+      <p id="liveStatus">Waiting</p>
+      <p id="liveMeta"></p>
+      <div class="progress-track"><div id="liveProgressBar"></div></div>
+      <div class="live-stats">
+        <div class="stat"><div class="stat-label">frame</div><div class="stat-val" id="liveFrame">—</div></div>
+        <div class="stat"><div class="stat-label">detections</div><div class="stat-val" id="liveDetections">—</div></div>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -265,6 +292,9 @@
   const chartPanel = $("chartPanel");
   const trackingFrameWrap = $("trackingFrameWrap");
   const trackingFrameImg = $("trackingFrameImg");
+  const livePanel = $("livePanel");
+  const liveFrameImg = $("liveFrameImg");
+  const liveProgressBar = $("liveProgressBar");
 
   let chosenFiles = [];   // File[]
   let lastResults = [];   // result objects from the backend
@@ -348,6 +378,11 @@
     const original = analyzeBtn.textContent;
     analyzeBtn.textContent = "Analyzing…";
     downloadBtn.style.display = "none";
+    lastResults = [];
+    resultsPanel.style.display = "none";
+    chartPanel.style.display = "none";
+    $("summaryPanel").style.display = "none";
+    resetLivePanel();
 
     const fd = new FormData();
     const sampleFps = $("sampleFps").value || "10";
@@ -364,21 +399,14 @@
     chosenFiles.forEach((f) => fd.append("files", f));
 
     try {
-      const res = await fetch("/api/analyze-batch", { method: "POST", body: fd });
+      const res = await fetch("/api/analyze-stream", { method: "POST", body: fd });
       if (!res.ok) {
         let detail = "Request failed (" + res.status + ")";
         try { const j = await res.json(); if (j.detail) detail = j.detail; } catch (_) {}
         showError(detail);
         return;
       }
-      const data = await res.json();
-      lastResults = data.results || [];
-      renderSummary(data.summary);
-      renderResults();
-      if (data.csv_token) {
-        downloadBtn.href = "/api/download/" + data.csv_token;
-        downloadBtn.style.display = "inline-block";
-      }
+      await readAnalysisStream(res);
     } catch (e) {
       showError("Could not reach the backend: " + e.message);
     } finally {
@@ -391,6 +419,104 @@
   function unitSpeed() { return usesMm ? "mm/s" : "px/s"; }
   function unitDist() { return usesMm ? "mm" : "px"; }
   function fmt(v) { return (v === null || v === undefined) ? "—" : Number(v).toFixed(2); }
+
+  function resetLivePanel() {
+    livePanel.style.display = "block";
+    liveFrameImg.removeAttribute("src");
+    liveProgressBar.style.width = "0%";
+    $("liveStatus").textContent = "Starting analysis";
+    $("liveMeta").textContent = "";
+    $("liveFrame").textContent = "n/a";
+    $("liveDetections").textContent = "n/a";
+  }
+
+  async function readAnalysisStream(res) {
+    if (!res.body) throw new Error("This browser cannot read the live analysis stream.");
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    while (true) {
+      const chunk = await reader.read();
+      buffer += decoder.decode(chunk.value || new Uint8Array(), { stream: !chunk.done });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+      lines.forEach(handleStreamLine);
+      if (chunk.done) break;
+    }
+    if (buffer.trim()) handleStreamLine(buffer);
+  }
+
+  function handleStreamLine(line) {
+    const clean = line.trim();
+    if (!clean) return;
+    handleStreamEvent(JSON.parse(clean));
+  }
+
+  function handleStreamEvent(event) {
+    if (event.type === "video_start") {
+      livePanel.style.display = "block";
+      liveProgressBar.style.width = "0%";
+      $("liveStatus").textContent = "Analyzing " + (event.video || "video");
+      $("liveMeta").textContent =
+        "video " + event.video_index + "/" + event.video_total +
+        " | native " + fmt(event.native_fps) + " fps" +
+        " | effective " + fmt(event.effective_fps) + " fps";
+      $("liveFrame").textContent = "0";
+      $("liveDetections").textContent = "n/a";
+      return;
+    }
+
+    if (event.type === "frame") {
+      if (event.image) liveFrameImg.src = event.image;
+      const analyzed = Number(event.analyzed_index || 0) + 1;
+      const total = event.frames_to_analyze ? Number(event.frames_to_analyze) : null;
+      const pct = total ? Math.max(0, Math.min(100, (analyzed / total) * 100)) : 0;
+      liveProgressBar.style.width = pct ? pct.toFixed(1) + "%" : "18%";
+      $("liveStatus").textContent = "Analyzing " + (event.video || "video");
+      $("liveMeta").textContent =
+        "video " + event.video_index + "/" + event.video_total +
+        " | time " + fmt(event.time_s) + "s" +
+        (total ? " | sampled " + analyzed + "/" + total : " | sampled " + analyzed);
+      $("liveFrame").textContent = event.frame_index ?? "n/a";
+      $("liveDetections").textContent = event.detections ?? 0;
+      return;
+    }
+
+    if (event.type === "video_done") {
+      liveProgressBar.style.width = "100%";
+      $("liveStatus").textContent = "Finished " + (event.video || "video");
+      $("liveMeta").textContent =
+        event.frames_analyzed + " sampled frames | " + event.worm_count + " tracked worm" +
+        (event.worm_count === 1 ? "" : "s");
+      return;
+    }
+
+    if (event.type === "video_error") {
+      $("liveStatus").textContent = "Error in " + (event.video || "video");
+      $("liveMeta").textContent = event.error || "";
+      return;
+    }
+
+    if (event.type === "fatal_error") {
+      showError(event.detail || "Analysis failed.");
+      $("liveStatus").textContent = "Analysis failed";
+      $("liveMeta").textContent = event.detail || "";
+      return;
+    }
+
+    if (event.type === "done") {
+      lastResults = event.results || [];
+      renderSummary(event.summary);
+      renderResults();
+      if (event.csv_token) {
+        downloadBtn.href = "/api/download/" + event.csv_token;
+        downloadBtn.style.display = "inline-block";
+      }
+      liveProgressBar.style.width = "100%";
+      $("liveStatus").textContent = "Analysis complete";
+    }
+  }
 
   function renderResults() {
     resultsPanel.style.display = lastResults.length ? "block" : "none";
