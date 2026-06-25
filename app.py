@@ -799,6 +799,13 @@ def _annotate_live_frame(frame, labeled: list):
             if len(kp) > 3 and kp[3]:
                 _draw_label(image, str(kp[3])[:16], px + 7, py - 7, endpoint_color, False)
 
+        # Draw the tracked CENTER: the midpoint of the two endpoints.
+        if len(points) >= 2:
+            mx = (points[0][0] + points[1][0]) // 2
+            my = (points[0][1] + points[1][1]) // 2
+            cv2.circle(image, (mx, my), 5, (255, 255, 255), thickness=-1, lineType=cv2.LINE_AA)
+            cv2.circle(image, (mx, my), 7, color, thickness=2, lineType=cv2.LINE_AA)
+
         center = _candidate_center(candidate)
         if center is not None:
             conf = _round_or_none(candidate.get("confidence"))
@@ -856,6 +863,13 @@ def _annotate_tracking_frame(frame, tracks: list[dict], selected_worm_id: int):
             cv2.circle(image, (px, py), radius + 2, (18, 21, 24), thickness=1, lineType=cv2.LINE_AA)
             if selected and len(kp) > 3 and kp[3]:
                 _draw_label(image, str(kp[3])[:16], px + 8, py - 8, endpoint_color, False)
+
+        # Draw the tracked CENTER: the midpoint of the two endpoints.
+        if len(points) >= 2:
+            mx = (points[0][0] + points[1][0]) // 2
+            my = (points[0][1] + points[1][1]) // 2
+            cv2.circle(image, (mx, my), radius + 1, (255, 255, 255), thickness=-1, lineType=cv2.LINE_AA)
+            cv2.circle(image, (mx, my), radius + 3, color, thickness=2, lineType=cv2.LINE_AA)
 
         cx, cy = center
         _draw_label(image, f"worm {worm_id}", cx * scale + 8, cy * scale - 12, color, selected)
