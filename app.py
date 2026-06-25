@@ -46,6 +46,24 @@ BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 DEFAULT_MODEL_PATH = BASE_DIR / "model" / "best.pt"
 
+
+def _load_local_env(path: Path) -> None:
+    """Load simple KEY=VALUE pairs from .env without adding another dependency."""
+    if not path.exists():
+        return
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+_load_local_env(BASE_DIR / ".env")
+
 app = FastAPI(title="Worm Tail Tracker")
 
 # In-memory store of generated CSVs, keyed by a random token. Lives for the
@@ -106,31 +124,52 @@ def get_model():
 
 
 # --------------------------------------------------------------------------- #
-# Roboflow workflow backend (temporary base model)
+# Roboflow workflow backend
 # --------------------------------------------------------------------------- #
 
-RF_API_KEY = os.environ.get("ROBOFLOW_API_KEY", "")
-# Direct-model id (workspace-public, not secret). When set we call the model
-# endpoint directly — this avoids the broken serverless *workflow* (its inner
-# `model` step references an undeclared `model_id` input) and works both hosted
-# and on a local inference server. Set ROBOFLOW_MODEL_ID="" to use the workflow.
-RF_MODEL_ID = os.environ.get("ROBOFLOW_MODEL_ID", "c-elegan-detection-5haae/1")
-RF_WORKSPACE = os.environ.get("ROBOFLOW_WORKSPACE", "andy-zhang-ud8qm")
-RF_WORKFLOW = os.environ.get("ROBOFLOW_WORKFLOW_ID", "c-elegan-detection-v1-logic")
-RF_IMAGE_INPUT = os.environ.get("ROBOFLOW_IMAGE_INPUT", "image")
+def _float_env(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+RF_API_KEY = os.environ.get("ROBOFLOW_API_KEY", "").strip()
+RF_WORKSPACE = os.environ.get("ROBOFLOW_WORKSPACE", "andy-zhang-ud8qm").strip()
+RF_WORKFLOW = os.environ.get("ROBOFLOW_WORKFLOW_ID", "c-elegan-detection-v6-logic").strip()
+RF_IMAGE_INPUT = os.environ.get("ROBOFLOW_IMAGE_INPUT", "image").strip()
+RF_USE_CACHE = os.environ.get("ROBOFLOW_USE_CACHE", "true").strip().lower() not in ("0", "false", "no")
+RF_CONFIDENCE = _float_env("ROBOFLOW_CONFIDENCE", 0.30)
+RF_WORKFLOW_TIMEOUT_S = _float_env("ROBOFLOW_WORKFLOW_TIMEOUT_S", 15.0)
+RF_MODEL_TIMEOUT_S = _float_env("ROBOFLOW_MODEL_TIMEOUT_S", 120.0)
+DEFAULT_PCUTOFF = _float_env("WORM_PCUTOFF", RF_CONFIDENCE)
+MAX_WORMS_PER_VIDEO = max(1, int(_float_env("WORM_MAX_TRACKS", 5)))
+MAX_MATCH_DISTANCE_PX = _float_env("WORM_MAX_MATCH_DISTANCE_PX", 150.0)
+TRACKING_FRAME_MAX_WIDTH = max(320, int(_float_env("WORM_TRACKING_FRAME_MAX_WIDTH", 900)))
+TRACKING_FRAME_JPEG_QUALITY = min(95, max(50, int(_float_env("WORM_TRACKING_FRAME_JPEG_QUALITY", 85))))
+
+# Optional escape hatch for the older direct-model backend. The default is now
+# the serverless Roboflow workflow requested by the user.
+RF_MODEL_ID = os.environ.get("ROBOFLOW_MODEL_ID", "").strip()
+RF_FALLBACK_MODEL_ID = os.environ.get("ROBOFLOW_FALLBACK_MODEL_ID", "c-elegan-detection-5haae/6").strip()
+_RF_CLIENT = None
+
 # Endpoint selection. This model emits two endpoints ("End-point1"=0,
 # "End-Point-2"=1) rather than head/tail, and the two ends of a worm move
-# differently. By default we track BOTH per frame and report whichever moved the
-# most (greatest displacement from its start) — "the farthest tail". Override to
-# pin a specific endpoint by index (WORM_ENDPOINT_INDEX) or by class name
-# (ROBOFLOW_TAIL_KEYPOINT) if you'd rather always track the same one.
+# differently. We first track the same worm detection across frames, then track
+# BOTH endpoints on that worm and report whichever moved farthest from its start.
+# Override to pin a specific endpoint by index (WORM_ENDPOINT_INDEX) or class
+# name (ROBOFLOW_TAIL_KEYPOINT).
 FORCE_ENDPOINT_NAME = os.environ.get("ROBOFLOW_TAIL_KEYPOINT", "").strip().lower()
 _force_idx_raw = os.environ.get("WORM_ENDPOINT_INDEX", "").strip()
 FORCE_ENDPOINT_INDEX = int(_force_idx_raw) if _force_idx_raw.lstrip("-").isdigit() else None
 
 
 def _rf_mode() -> str:
-    """'model' for direct-model inference (default), 'workflow' otherwise."""
+    """'workflow' by default; 'model' only when ROBOFLOW_MODEL_ID is set."""
     return "model" if RF_MODEL_ID else "workflow"
 
 
@@ -139,9 +178,7 @@ def _rf_base() -> str:
     explicit = os.environ.get("ROBOFLOW_API_URL", "").strip()
     if explicit:
         return explicit.rstrip("/")
-    # Direct model works on the hosted serverless endpoint; the workflow path
-    # historically targets a local inference server.
-    return "https://serverless.roboflow.com" if _rf_mode() == "model" else "http://localhost:9001"
+    return "https://serverless.roboflow.com"
 
 
 def active_backend() -> str:
@@ -156,34 +193,36 @@ def active_backend() -> str:
     return "roboflow" if RF_API_KEY else "ultralytics"
 
 
-def _roboflow_infer(frame):
-    """POST one frame to Roboflow (direct model or workflow); return the JSON."""
-    ok, buf = cv2.imencode(".jpg", frame)
+def _roboflow_client():
+    """Return an inference-sdk client when the optional package is installed."""
+    global _RF_CLIENT
+
+    if _RF_CLIENT is not None:
+        return _RF_CLIENT
+    try:
+        from inference_sdk import InferenceHTTPClient
+    except ImportError:
+        return None
+
+    _RF_CLIENT = InferenceHTTPClient(api_url=_rf_base(), api_key=RF_API_KEY)
+    return _RF_CLIENT
+
+
+def _frame_to_temp_jpeg(frame) -> str:
+    fd, path = tempfile.mkstemp(suffix=".jpg")
+    os.close(fd)
+    ok = cv2.imwrite(path, frame)
     if not ok:
+        _safe_unlink(path)
         raise ValueError("Failed to JPEG-encode frame for Roboflow.")
-    b64 = base64.b64encode(buf.tobytes()).decode("ascii")
-    base = _rf_base()
+    return path
 
-    if _rf_mode() == "model":
-        url = f"{base}/{RF_MODEL_ID}?api_key={RF_API_KEY}"
-        kwargs = dict(
-            content=b64,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-        )
-    else:
-        url = f"{base}/infer/workflows/{RF_WORKSPACE}/{RF_WORKFLOW}"
-        kwargs = dict(
-            json={
-                "api_key": RF_API_KEY,
-                "inputs": {RF_IMAGE_INPUT: {"type": "base64", "value": b64}},
-                "use_cache": True,
-            }
-        )
 
+def _post_roboflow(url: str, timeout: float, attempts: int = 2, **kwargs):
     last_exc = None
-    for _ in range(2):  # one light retry for transient hiccups
+    for _ in range(attempts):
         try:
-            resp = httpx.post(url, timeout=120, **kwargs)
+            resp = httpx.post(url, timeout=timeout, **kwargs)
             if resp.status_code != 200:
                 raise RuntimeError(
                     f"Roboflow returned HTTP {resp.status_code}: {resp.text[:300]}"
@@ -191,8 +230,87 @@ def _roboflow_infer(frame):
             return resp.json()
         except httpx.HTTPError as exc:
             last_exc = exc
-    safe_url = url.split("?")[0]  # never echo the api_key in errors
-    raise RuntimeError(f"Could not reach Roboflow at {safe_url}: {last_exc}")
+    raise RuntimeError(f"Could not reach Roboflow at {url}: {last_exc}")
+
+
+def _roboflow_workflow_http(frame):
+    ok, buf = cv2.imencode(".jpg", frame)
+    if not ok:
+        raise ValueError("Failed to JPEG-encode frame for Roboflow.")
+    b64 = base64.b64encode(buf.tobytes()).decode("ascii")
+    base = _rf_base()
+    url = f"{base}/infer/workflows/{RF_WORKSPACE}/{RF_WORKFLOW}"
+    return _post_roboflow(
+        url,
+        timeout=RF_WORKFLOW_TIMEOUT_S,
+        attempts=1,
+        json={
+            "api_key": RF_API_KEY,
+            "inputs": {RF_IMAGE_INPUT: {"type": "base64", "value": b64}},
+            "use_cache": RF_USE_CACHE,
+        },
+    )
+
+
+def _workflow_fallback_error(exc: Exception) -> bool:
+    text = str(exc)
+    return (
+        "InnerWorkflowParameterBindingsUnknownInputError" in text
+        or "unknown child workflow input names ['model_id']" in text
+        or "ReadTimeout" in text
+        or "Could not reach Roboflow" in text
+    )
+
+
+def _roboflow_direct_model_http(frame, model_id: str | None = None):
+    model_id = model_id or RF_MODEL_ID or RF_FALLBACK_MODEL_ID
+    if not model_id:
+        raise RuntimeError("No Roboflow direct model id is configured.")
+
+    ok, buf = cv2.imencode(".jpg", frame)
+    if not ok:
+        raise ValueError("Failed to JPEG-encode frame for Roboflow.")
+    b64 = base64.b64encode(buf.tobytes()).decode("ascii")
+    url = f"{_rf_base()}/{model_id}"
+    return _post_roboflow(
+        url,
+        timeout=RF_MODEL_TIMEOUT_S,
+        attempts=2,
+        params={"api_key": RF_API_KEY, "confidence": int(RF_CONFIDENCE * 100)},
+        content=b64,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+
+
+def _roboflow_infer(frame):
+    """Run one frame through the configured Roboflow workflow/model."""
+    if _rf_mode() == "model":
+        return _roboflow_direct_model_http(frame)
+
+    client = _roboflow_client()
+    if client is None:
+        try:
+            return _roboflow_workflow_http(frame)
+        except RuntimeError as exc:
+            if _workflow_fallback_error(exc):
+                return _roboflow_direct_model_http(frame, RF_FALLBACK_MODEL_ID)
+            raise
+
+    image_path = _frame_to_temp_jpeg(frame)
+    try:
+        try:
+            return client.run_workflow(
+                workspace_name=RF_WORKSPACE,
+                workflow_id=RF_WORKFLOW,
+                images={RF_IMAGE_INPUT: image_path},
+                use_cache=RF_USE_CACHE,
+            )
+        except Exception as exc:  # noqa: BLE001 - SDK wraps server errors
+            if _workflow_fallback_error(exc):
+                return _roboflow_direct_model_http(frame, RF_FALLBACK_MODEL_ID)
+            raise
+    finally:
+        _safe_unlink(image_path)
 
 
 def _find_predictions(obj):
@@ -221,28 +339,75 @@ def _find_predictions(obj):
     return None
 
 
-def _parse_roboflow_keypoints(data):
+def _safe_float(value, default=0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _candidate_center(candidate: dict):
+    x = candidate.get("x")
+    y = candidate.get("y")
+    if x is not None and y is not None:
+        return float(x), float(y)
+
+    kps = candidate.get("keypoints") or []
+    if not kps:
+        return None
+    xs = [kp[0] for kp in kps if not np.isnan(kp[0])]
+    ys = [kp[1] for kp in kps if not np.isnan(kp[1])]
+    if not xs or not ys:
+        return None
+    return float(np.mean(xs)), float(np.mean(ys))
+
+
+def _parse_roboflow_detections(data):
     """
-    Return ALL keypoints of the most confident detection from a Roboflow
-    response as a list of (x, y, conf, name) in the model's keypoint order, or
-    None if no worm/keypoint was found. Endpoint selection happens later, after
-    we've seen how much each one moved across the whole clip.
+    Return every worm detection at or above RF_CONFIDENCE, sorted by confidence.
+    Each candidate carries the full keypoint list so a later pass can associate
+    the same worm across frames instead of jumping to the per-frame best match.
     """
     preds = _find_predictions(data)
     if not preds:
-        return None
-    best = max(preds, key=lambda p: p.get("confidence", 0.0) or 0.0)
-    kps = best.get("keypoints") or []
-    if not kps:
-        return None
+        return []
 
-    out = []
-    for kp in kps:
-        name = str(kp.get("class_name", kp.get("class", ""))).strip()
-        conf = kp.get("confidence")
-        out.append((float(kp["x"]), float(kp["y"]),
-                    float(conf if conf is not None else 1.0), name))
-    return out
+    detections = []
+    for pred in preds:
+        det_conf = _safe_float(pred.get("confidence"), 0.0)
+        if det_conf < RF_CONFIDENCE:
+            continue
+
+        kps = []
+        for kp in pred.get("keypoints") or []:
+            if "x" not in kp or "y" not in kp:
+                continue
+            name = str(kp.get("class_name", kp.get("class", ""))).strip()
+            conf = _safe_float(kp.get("confidence"), det_conf)
+            kps.append((float(kp["x"]), float(kp["y"]), conf, name))
+        if not kps:
+            continue
+
+        candidate = {
+            "x": pred.get("x"),
+            "y": pred.get("y"),
+            "confidence": det_conf,
+            "class": pred.get("class_name", pred.get("class", "")),
+            "keypoints": kps,
+        }
+        if _candidate_center(candidate) is not None:
+            detections.append(candidate)
+
+    return sorted(detections, key=lambda c: c["confidence"], reverse=True)
+
+
+def _parse_roboflow_keypoints(data):
+    """
+    Backwards-compatible helper: return keypoints for the highest-confidence
+    detection after applying the Roboflow confidence floor.
+    """
+    detections = _parse_roboflow_detections(data)
+    return detections[0]["keypoints"] if detections else None
 
 
 def _roboflow_unconfigured_detail() -> str:
@@ -255,9 +420,10 @@ def _roboflow_unconfigured_detail() -> str:
 
 def make_detector():
     """
-    Build a `frame -> list[(x, y, conf, name)] | None` callable for the active
-    backend (all keypoints of the best detection). Raises HTTPException(503) if
-    that backend isn't ready, so callers get the same clean 503 either way.
+    Build a `frame -> list[candidate]` callable for the active backend. Each
+    candidate is one worm detection with all of its keypoints. Raises
+    HTTPException(503) if that backend isn't ready, so callers get the same
+    clean 503 either way.
     """
     backend = active_backend()
     if backend == "roboflow":
@@ -265,14 +431,14 @@ def make_detector():
             raise HTTPException(status_code=503, detail=_roboflow_unconfigured_detail())
 
         def detect(frame):
-            return _parse_roboflow_keypoints(_roboflow_infer(frame))
+            return _parse_roboflow_detections(_roboflow_infer(frame))
 
         return detect
 
     model = get_model()  # may raise HTTPException(503)
 
     def detect(frame):
-        return _extract_keypoints(model(frame, verbose=False)[0])
+        return _extract_worm_candidates(model(frame, verbose=False)[0])
 
     return detect
 
@@ -284,77 +450,387 @@ def make_detector():
 _YOLO_KP_NAMES = ["head", "tail"]  # index 0 = head, 1 = tail (build-spec contract)
 
 
-def _extract_keypoints(result):
+def _extract_worm_candidates(result):
     """
-    From a single-frame YOLO result, return ALL keypoints of the highest-
-    confidence detection as a list of (x, y, conf, name), or None if no worm was
-    detected. Index 0 is named "head", index 1 "tail", per the model contract.
+    From a single-frame YOLO result, return all worm candidates at or above the
+    confidence floor. Index 0 is named "head", index 1 "tail", per the model
+    contract.
     """
     kpts = getattr(result, "keypoints", None)
     if kpts is None or kpts.xy is None or len(kpts.xy) == 0:
-        return None
+        return []
 
-    # Choose the most confident detection if several worms appear.
+    xy_all = kpts.xy.cpu().numpy()  # shape (N, K, 2)
+    if xy_all.shape[0] == 0:
+        return []
+    kconf_all = kpts.conf.cpu().numpy() if kpts.conf is not None else None
+
     boxes = getattr(result, "boxes", None)
     if boxes is not None and boxes.conf is not None and len(boxes.conf) > 0:
-        best_i = int(np.argmax(boxes.conf.cpu().numpy()))
+        box_confs = boxes.conf.cpu().numpy()
     else:
-        best_i = 0
+        box_confs = np.ones((xy_all.shape[0],), dtype=float)
 
-    xy = kpts.xy[best_i].cpu().numpy()  # shape (K, 2)
-    if xy.shape[0] == 0:
-        return None
-    kconf = kpts.conf[best_i].cpu().numpy() if kpts.conf is not None else None
+    candidates = []
+    for det_i in range(xy_all.shape[0]):
+        det_conf = float(box_confs[det_i]) if det_i < len(box_confs) else 1.0
+        if det_conf < RF_CONFIDENCE:
+            continue
 
-    out = []
-    for i in range(xy.shape[0]):
-        conf = float(kconf[i]) if kconf is not None else 1.0
-        name = _YOLO_KP_NAMES[i] if i < len(_YOLO_KP_NAMES) else f"kp{i}"
-        out.append((float(xy[i][0]), float(xy[i][1]), conf, name))
-    return out
+        xy = xy_all[det_i]
+        if xy.shape[0] == 0:
+            continue
+        kconf = kconf_all[det_i] if kconf_all is not None else None
+        keypoints = []
+        for i in range(xy.shape[0]):
+            conf = float(kconf[i]) if kconf is not None else det_conf
+            name = _YOLO_KP_NAMES[i] if i < len(_YOLO_KP_NAMES) else f"kp{i}"
+            keypoints.append((float(xy[i][0]), float(xy[i][1]), conf, name))
+
+        candidate = {
+            "x": float(np.mean(xy[:, 0])),
+            "y": float(np.mean(xy[:, 1])),
+            "confidence": det_conf,
+            "class": "worm",
+            "keypoints": keypoints,
+        }
+        candidates.append(candidate)
+
+    return sorted(candidates, key=lambda c: c["confidence"], reverse=True)
 
 
-def analyze_video_file(path: str, sample_fps: float, pcutoff: float, px_per_mm):
+def _extract_keypoints(result):
+    """Backwards-compatible helper for older tests/tools."""
+    candidates = _extract_worm_candidates(result)
+    return candidates[0]["keypoints"] if candidates else None
+
+
+def _distance_sq(a, b) -> float:
+    if a is None or b is None:
+        return float("inf")
+    return (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2
+
+
+def _top_seed_candidates(candidates: list[dict], max_tracks: int) -> list[dict]:
+    viable = [c for c in (candidates or []) if c.get("keypoints") and _candidate_center(c) is not None]
+    return sorted(viable, key=lambda c: _safe_float(c.get("confidence"), 0.0), reverse=True)[:max_tracks]
+
+
+def _assign_candidates_to_tracks(tracks: list[dict], candidates: list[dict]) -> None:
+    viable = [c for c in (candidates or []) if c.get("keypoints") and _candidate_center(c) is not None]
+    if not viable:
+        for track in tracks:
+            track["frames"].append(None)
+        return
+
+    pairs = []
+    for track_i, track in enumerate(tracks):
+        for cand_i, candidate in enumerate(viable):
+            pairs.append((
+                _distance_sq(track["last_center"], _candidate_center(candidate)),
+                -_safe_float(candidate.get("confidence"), 0.0),
+                track_i,
+                cand_i,
+            ))
+
+    assigned_tracks = set()
+    assigned_candidates = set()
+    assigned = {}
+    for _, _, track_i, cand_i in sorted(pairs):
+        if track_i in assigned_tracks or cand_i in assigned_candidates:
+            continue
+        dist_sq = _distance_sq(tracks[track_i]["last_center"], _candidate_center(viable[cand_i]))
+        if MAX_MATCH_DISTANCE_PX > 0 and dist_sq > MAX_MATCH_DISTANCE_PX ** 2:
+            continue
+        assigned_tracks.add(track_i)
+        assigned_candidates.add(cand_i)
+        assigned[track_i] = viable[cand_i]
+
+    for track_i, track in enumerate(tracks):
+        candidate = assigned.get(track_i)
+        if candidate is None:
+            track["frames"].append(None)
+            continue
+        track["frames"].append(candidate["keypoints"])
+        track["last_center"] = _candidate_center(candidate)
+
+
+def _select_same_worm_tracks(frames_candidates: list[list[dict]], max_tracks: int = MAX_WORMS_PER_VIDEO):
     """
-    Run inference over one video and return the response dict (spec §5 shape).
-
-    Raises ValueError for un-openable / non-video files so callers can decide
-    whether to abort (single) or record a per-video error (batch).
+    Seed up to `max_tracks` worm identities from the first frame with detections,
+    using confidence order. Later frames assign detections one-to-one by nearest
+    center so the same identities are followed throughout the video.
     """
-    detect = make_detector()  # backend-agnostic; may raise HTTPException(503)
+    seed_frame = None
+    seeds = []
+    for frame_i, candidates in enumerate(frames_candidates):
+        seeds = _top_seed_candidates(candidates, max_tracks)
+        if seeds:
+            seed_frame = frame_i
+            break
+
+    if seed_frame is None:
+        return []
+
+    tracks = []
+    for track_i, seed in enumerate(seeds, start=1):
+        tracks.append({
+            "worm_id": track_i,
+            "seed_frame": seed_frame,
+            "seed_confidence": _safe_float(seed.get("confidence"), 0.0),
+            "last_center": _candidate_center(seed),
+            "frames": [None for _ in range(seed_frame)] + [seed["keypoints"]],
+        })
+
+    for candidates in frames_candidates[seed_frame + 1:]:
+        _assign_candidates_to_tracks(tracks, candidates)
+
+    return tracks
+
+
+def _select_same_worm_track(frames_candidates: list[list[dict]]):
+    """Backwards-compatible helper for tests/tools that expect one track."""
+    tracks = _select_same_worm_tracks(frames_candidates, max_tracks=1)
+    return tracks[0]["frames"] if tracks else []
+
+
+def _read_video_frame(path: str, frame_index: int):
+    """Read a specific source video frame for the visual tracking preview."""
+    target = max(0, int(frame_index))
 
     cap = cv2.VideoCapture(path)
-    if not cap.isOpened():
-        raise ValueError("Could not open file as a video.")
+    try:
+        if cap.isOpened():
+            cap.set(cv2.CAP_PROP_POS_FRAMES, target)
+            ok, frame = cap.read()
+            if ok:
+                return frame
+    finally:
+        cap.release()
 
-    # Per-video native fps — never assume a global value (spec §4).
-    native_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    if native_fps <= 0:
-        native_fps = 30.0
-    step = max(1, round(native_fps / sample_fps))
-    effective_fps = native_fps / step  # <- THIS goes into compute_track_speed
+    # Some codecs ignore random seek; fall back to a sequential read.
+    cap = cv2.VideoCapture(path)
+    try:
+        if not cap.isOpened():
+            return None
+        frame = None
+        for current in range(target + 1):
+            ok, frame = cap.read()
+            if not ok:
+                return None
+            if current == target:
+                return frame
+    finally:
+        cap.release()
+    return None
 
-    # Sequential read + skip; only run inference every step-th frame. Keep ALL
-    # keypoints per frame — we choose which endpoint to report after seeing how
-    # much each moved across the whole clip.
-    frames_kps = []  # each: list[(x,y,conf,name)] or None
-    frame_idx = 0
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
-        if frame_idx % step == 0:
-            frames_kps.append(detect(frame))
-        frame_idx += 1
-    cap.release()
 
-    frames_analyzed = len(frames_kps)
-    if frames_analyzed == 0:
-        raise ValueError("No frames could be decoded from this file.")
+def _kp_xy(kp):
+    if kp is None or len(kp) < 2:
+        return None
+    x, y = float(kp[0]), float(kp[1])
+    if np.isnan(x) or np.isnan(y):
+        return None
+    return x, y
 
+
+def _track_seed_keypoints(track: dict):
+    seed_frame = int(track.get("seed_frame", 0))
+    frames = track.get("frames") or []
+    if seed_frame < 0 or seed_frame >= len(frames):
+        return []
+    return frames[seed_frame] or []
+
+
+def _keypoints_center(keypoints):
+    points = [_kp_xy(kp) for kp in (keypoints or [])]
+    points = [p for p in points if p is not None]
+    if not points:
+        return None
+    xs, ys = zip(*points)
+    return float(np.mean(xs)), float(np.mean(ys))
+
+
+def _draw_label(image, text: str, x: float, y: float, color, selected: bool) -> None:
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = 0.55 if image.shape[1] >= 520 else 0.45
+    thickness = 2 if selected else 1
+    (tw, th), baseline = cv2.getTextSize(text, font, scale, thickness)
+    pad = 5
+    ix = int(max(0, min(x, image.shape[1] - tw - pad * 2 - 1)))
+    iy = int(max(th + pad, min(y, image.shape[0] - baseline - pad - 1)))
+    bg = (18, 21, 24) if selected else (32, 38, 43)
+    cv2.rectangle(
+        image,
+        (ix, iy - th - pad),
+        (ix + tw + pad * 2, iy + baseline + pad),
+        bg,
+        thickness=-1,
+    )
+    cv2.rectangle(
+        image,
+        (ix, iy - th - pad),
+        (ix + tw + pad * 2, iy + baseline + pad),
+        color,
+        thickness=1,
+    )
+    cv2.putText(image, text, (ix + pad, iy), font, scale, color, thickness, cv2.LINE_AA)
+
+
+def _encode_jpeg_data_url(image) -> str | None:
+    ok, buf = cv2.imencode(
+        ".jpg",
+        image,
+        [int(cv2.IMWRITE_JPEG_QUALITY), TRACKING_FRAME_JPEG_QUALITY],
+    )
+    if not ok:
+        return None
+    b64 = base64.b64encode(buf.tobytes()).decode("ascii")
+    return f"data:image/jpeg;base64,{b64}"
+
+
+def _annotate_tracking_frame(frame, tracks: list[dict], selected_worm_id: int):
+    image = frame.copy()
+    scale = 1.0
+    if image.shape[1] > TRACKING_FRAME_MAX_WIDTH:
+        scale = TRACKING_FRAME_MAX_WIDTH / image.shape[1]
+        new_size = (TRACKING_FRAME_MAX_WIDTH, max(1, int(round(image.shape[0] * scale))))
+        image = cv2.resize(image, new_size, interpolation=cv2.INTER_AREA)
+
+    selected_color = (168, 231, 110)  # #6EE7A8, BGR for OpenCV
+    muted_color = (132, 144, 152)
+    endpoint_color = (61, 163, 232)  # #E8A33D, BGR
+
+    for track in tracks:
+        worm_id = int(track.get("worm_id", 0))
+        keypoints = _track_seed_keypoints(track)
+        center = _keypoints_center(keypoints)
+        if center is None:
+            continue
+
+        selected = worm_id == selected_worm_id
+        color = selected_color if selected else muted_color
+        thickness = 3 if selected else 1
+        radius = 5 if selected else 3
+        points = []
+        for kp in keypoints:
+            xy = _kp_xy(kp)
+            if xy is None:
+                continue
+            points.append((int(round(xy[0] * scale)), int(round(xy[1] * scale)), kp))
+
+        if len(points) >= 2:
+            for i in range(len(points) - 1):
+                cv2.line(image, points[i][:2], points[i + 1][:2], color, thickness, cv2.LINE_AA)
+
+        for px, py, kp in points:
+            cv2.circle(image, (px, py), radius, color, thickness=-1, lineType=cv2.LINE_AA)
+            cv2.circle(image, (px, py), radius + 2, (18, 21, 24), thickness=1, lineType=cv2.LINE_AA)
+            if selected and len(kp) > 3 and kp[3]:
+                _draw_label(image, str(kp[3])[:16], px + 8, py - 8, endpoint_color, False)
+
+        cx, cy = center
+        _draw_label(image, f"worm {worm_id}", cx * scale + 8, cy * scale - 12, color, selected)
+
+    return image
+
+
+def _tracking_frame_payloads(path: str, tracks: list[dict], native_fps: float, step: int) -> dict[int, dict]:
+    if not tracks:
+        return {}
+
+    seed_frame = int(tracks[0].get("seed_frame", 0))
+    source_frame_index = seed_frame * max(1, int(step))
+    frame = _read_video_frame(path, source_frame_index)
+    if frame is None:
+        return {}
+
+    payloads = {}
+    for track in tracks:
+        worm_id = int(track["worm_id"])
+        annotated = _annotate_tracking_frame(frame, tracks, selected_worm_id=worm_id)
+        data_url = _encode_jpeg_data_url(annotated)
+        if not data_url:
+            continue
+        payloads[worm_id] = {
+            "tracking_frame_image": data_url,
+            "tracking_frame_index": source_frame_index,
+            "tracking_frame_analyzed_index": seed_frame,
+            "tracking_frame_time_s": round(source_frame_index / native_fps, 3) if native_fps else None,
+        }
+    return payloads
+
+
+def _per_second_speed_bins(speed_series_px_s: list, effective_fps: float, px_per_mm):
+    """
+    Average the selected worm's speed into one-second buckets. Each speed sample
+    represents the interval between two analyzed frames, so intervals are
+    duration-weighted when they straddle a second boundary.
+    """
+    if not speed_series_px_s or effective_fps <= 0:
+        return []
+
+    dt = 1.0 / effective_fps
+    total_duration = len(speed_series_px_s) * dt
+    n_bins = int(np.ceil(total_duration))
+    weighted_sums = [0.0 for _ in range(n_bins)]
+    valid_durations = [0.0 for _ in range(n_bins)]
+
+    for i, speed in enumerate(speed_series_px_s):
+        if speed is None:
+            continue
+        value = _safe_float(speed, np.nan)
+        if np.isnan(value):
+            continue
+
+        interval_start = i * dt
+        interval_end = (i + 1) * dt
+        first_bin = int(np.floor(interval_start))
+        last_bin = int(np.ceil(interval_end))
+        for bin_i in range(first_bin, min(last_bin, n_bins)):
+            overlap = min(interval_end, bin_i + 1.0) - max(interval_start, float(bin_i))
+            if overlap <= 0:
+                continue
+            weighted_sums[bin_i] += value * overlap
+            valid_durations[bin_i] += overlap
+
+    bins = []
+    for second in range(n_bins):
+        avg_px = (
+            weighted_sums[second] / valid_durations[second]
+            if valid_durations[second] > 0
+            else None
+        )
+        bucket = {
+            "second": second,
+            "start_s": round(float(second), 3),
+            "end_s": round(float(min(second + 1.0, total_duration)), 3),
+            "avg_speed_px_s": _round_or_none(avg_px),
+            "tracked_duration_s": round(float(valid_durations[second]), 3),
+        }
+        if px_per_mm:
+            bucket["avg_speed_mm_s"] = (
+                _round_or_none(avg_px / px_per_mm) if avg_px is not None else None
+            )
+        bins.append(bucket)
+
+    return bins
+
+
+def _analyze_worm_track(
+    path: str,
+    track: dict,
+    native_fps: float,
+    effective_fps: float,
+    frames_analyzed: int,
+    pcutoff: float,
+    px_per_mm,
+    tracked_worm_count: int,
+):
+    frames_kps = track["frames"]
     n_kp = max((len(f) for f in frames_kps if f), default=0)
     if n_kp == 0:
-        raise ValueError("No worm/keypoints were ever detected in this video.")
+        return None
 
     # Build one (xs, ys, confs) track per keypoint index. A frame where the worm
     # (or that keypoint) is missing becomes a NaN gap (conf 0), never a fake 0.
@@ -390,6 +866,9 @@ def analyze_video_file(path: str, sample_fps: float, pcutoff: float, px_per_mm):
         xs, ys, confs, fps=effective_fps, pcutoff=pcutoff, px_per_mm=px_per_mm
     )
     disp = compute_displacement(xs, ys, confs, pcutoff=pcutoff, px_per_mm=px_per_mm)
+    per_second_speed = _per_second_speed_bins(
+        metrics["speed_series_px_s"], effective_fps=effective_fps, px_per_mm=px_per_mm
+    )
 
     # time_series_s is one timestamp per speed value (i.e. per interval).
     # speed[i] covers the interval between analyzed frame i and i+1; we label it
@@ -400,9 +879,16 @@ def analyze_video_file(path: str, sample_fps: float, pcutoff: float, px_per_mm):
     # When the farthest-reach happened (seconds from start), for the chart.
     far_frame = disp.get("farthest_displacement_frame")
     far_time = round(far_frame / effective_fps, 3) if far_frame is not None else None
+    seed_frame = int(track.get("seed_frame", 0))
 
-    response = {
+    return {
         "video": os.path.basename(path),
+        "worm_id": int(track["worm_id"]),
+        "worm_label": f"worm {int(track['worm_id'])}",
+        "tracked_worm_count": tracked_worm_count,
+        "seed_frame": seed_frame,
+        "seed_time_s": round(seed_frame / effective_fps, 3),
+        "seed_confidence": _round_or_none(track.get("seed_confidence")),
         "backend": active_backend(),
         "native_fps": round(float(native_fps), 3),
         "effective_fps": round(float(effective_fps), 3),
@@ -411,15 +897,14 @@ def analyze_video_file(path: str, sample_fps: float, pcutoff: float, px_per_mm):
         "avg_speed_px_s": _round_or_none(metrics["avg_speed_px_s"]),
         "max_speed_px_s": _round_or_none(metrics["max_speed_px_s"]),
         "total_distance_px": round(metrics["total_distance_px"], 3),
-        # New: how far the tail got from its start, and start->endpoint.
         "farthest_displacement_px": _round_or_none(disp["farthest_displacement_px"]),
         "net_displacement_px": _round_or_none(disp["net_displacement_px"]),
         "farthest_displacement_time_s": far_time,
-        # Which of the worm's endpoints we report: the one that moved the most.
         "tracked_endpoint_index": chosen,
         "tracked_endpoint_name": endpoint_names[chosen] or f"kp{chosen}",
         "endpoints": per_endpoint,
         "speed_series_px_s": metrics["speed_series_px_s"],
+        "per_second_speed": per_second_speed,
         "time_series_s": time_series_s,
         "avg_speed_mm_s": _round_or_none(metrics.get("avg_speed_mm_s")),
         "max_speed_mm_s": _round_or_none(metrics.get("max_speed_mm_s")),
@@ -427,7 +912,75 @@ def analyze_video_file(path: str, sample_fps: float, pcutoff: float, px_per_mm):
         "farthest_displacement_mm": _round_or_none(disp.get("farthest_displacement_mm")),
         "net_displacement_mm": _round_or_none(disp.get("net_displacement_mm")),
     }
-    return response
+
+
+def analyze_video_file(path: str, sample_fps: float, pcutoff: float, px_per_mm):
+    """
+    Run inference over one video and return one result dict per tracked worm.
+
+    Raises ValueError for un-openable / non-video files so callers can decide
+    whether to abort (single) or record a per-video error (batch).
+    """
+    detect = make_detector()  # backend-agnostic; may raise HTTPException(503)
+
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        raise ValueError("Could not open file as a video.")
+
+    # Per-video native fps — never assume a global value (spec §4).
+    native_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    if native_fps <= 0:
+        native_fps = 30.0
+    step = max(1, round(native_fps / sample_fps))
+    effective_fps = native_fps / step  # <- THIS goes into compute_track_speed
+
+    # Sequential read + skip; only run inference every step-th frame. Keep ALL
+    # worm candidates until the identity tracker chooses one continuous worm.
+    frames_candidates = []  # each: list[candidate]
+    frame_idx = 0
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        if frame_idx % step == 0:
+            frames_candidates.append(detect(frame) or [])
+        frame_idx += 1
+    cap.release()
+
+    frames_analyzed = len(frames_candidates)
+    if frames_analyzed == 0:
+        raise ValueError("No frames could be decoded from this file.")
+
+    worm_tracks = _select_same_worm_tracks(frames_candidates, max_tracks=MAX_WORMS_PER_VIDEO)
+    if not worm_tracks:
+        raise ValueError("No worm/keypoints were ever detected in this video.")
+
+    tracking_frame_payloads = _tracking_frame_payloads(
+        path=path,
+        tracks=worm_tracks,
+        native_fps=native_fps,
+        step=step,
+    )
+
+    results = []
+    for track in worm_tracks:
+        result = _analyze_worm_track(
+            path=path,
+            track=track,
+            native_fps=native_fps,
+            effective_fps=effective_fps,
+            frames_analyzed=frames_analyzed,
+            pcutoff=pcutoff,
+            px_per_mm=px_per_mm,
+            tracked_worm_count=len(worm_tracks),
+        )
+        if result is not None:
+            result.update(tracking_frame_payloads.get(result["worm_id"], {}))
+            results.append(result)
+
+    if not results:
+        raise ValueError("No worm/keypoints were ever detected in this video.")
+    return results
 
 
 def _choose_endpoint(per_endpoint: list[dict]) -> int:
@@ -472,6 +1025,10 @@ def _save_upload_to_temp(upload: UploadFile) -> str:
 
 CSV_BASE_COLUMNS = [
     "video",
+    "worm_id",
+    "seed_confidence",
+    "seed_frame",
+    "seed_time_s",
     "native_fps",
     "frames_analyzed",
     "frames_tracked_pct",
@@ -504,11 +1061,11 @@ def _batch_summary(results: list[dict], used_mm: bool) -> dict:
     speeds = [r[speed_key] for r in ok if r.get(speed_key) is not None]
     avg_speed = round(sum(speeds) / len(speeds), 3) if speeds else None
 
-    far_video, far_value = None, None
+    far_video, far_worm_id, far_value = None, None, None
     for r in ok:
         v = r.get(far_key)
         if v is not None and (far_value is None or v > far_value):
-            far_value, far_video = v, r.get("video")
+            far_value, far_video, far_worm_id = v, r.get("video"), r.get("worm_id")
 
     return {
         "videos_total": len(results),
@@ -519,11 +1076,27 @@ def _batch_summary(results: list[dict], used_mm: bool) -> dict:
         "avg_speed": avg_speed,
         "farthest_displacement": round(far_value, 3) if far_value is not None else None,
         "farthest_displacement_video": far_video,
+        "farthest_displacement_worm_id": far_worm_id,
     }
 
 
+def _per_second_csv_columns(results: list[dict], used_calibration: bool):
+    max_bins = max((len(r.get("per_second_speed", [])) for r in results if "error" not in r), default=0)
+    columns = []
+    for second in range(max_bins):
+        columns.append((f"second_{second}_{second + 1}_avg_speed_px_s", second, "avg_speed_px_s"))
+        if used_calibration:
+            columns.append((f"second_{second}_{second + 1}_avg_speed_mm_s", second, "avg_speed_mm_s"))
+    return columns
+
+
 def _build_csv(results: list[dict], used_calibration: bool) -> str:
-    columns = CSV_BASE_COLUMNS + (CSV_MM_COLUMNS if used_calibration else [])
+    second_columns = _per_second_csv_columns(results, used_calibration)
+    base_columns = CSV_BASE_COLUMNS + (CSV_MM_COLUMNS if used_calibration else [])
+    columns = (
+        base_columns
+        + [name for name, _, _ in second_columns]
+    )
     buf = io.StringIO()
     writer = csv.writer(buf)
     writer.writerow(columns)
@@ -533,7 +1106,11 @@ def _build_csv(results: list[dict], used_calibration: bool) -> str:
             # CSV stays a clean rectangle that lines up with the header.
             row = [r.get("video", "")] + ["" for _ in columns[1:]]
         else:
-            row = [r.get(col, "") for col in columns]
+            row = [r.get(col, "") for col in base_columns]
+            per_second = r.get("per_second_speed", [])
+            for _, second, key in second_columns:
+                value = per_second[second].get(key) if second < len(per_second) else ""
+                row.append("" if value is None else value)
         writer.writerow(row)
     return buf.getvalue()
 
@@ -552,10 +1129,15 @@ def model_status():
             return {"ready": False, "backend": backend, "detail": _roboflow_unconfigured_detail()}
         base = _rf_base()
         target = f"{RF_MODEL_ID}" if _rf_mode() == "model" else f"workflow {RF_WORKSPACE}/{RF_WORKFLOW}"
+        fallback = "" if _rf_mode() == "model" else f" (fallback {RF_FALLBACK_MODEL_ID})"
         # Light reachability check against the inference server root.
         try:
             httpx.get(base, timeout=5)
-            return {"ready": True, "backend": backend, "detail": f"Roboflow {target} @ {base}"}
+            return {
+                "ready": True,
+                "backend": backend,
+                "detail": f"Roboflow {target}{fallback} @ {base}, confidence {RF_CONFIDENCE:.2f}",
+            }
         except httpx.HTTPError as exc:
             return {
                 "ready": False,
@@ -581,15 +1163,16 @@ def model_status():
 async def analyze(
     file: UploadFile = File(...),
     sample_fps: float = Form(10.0),
-    pcutoff: float = Form(0.5),
+    pcutoff: float = Form(DEFAULT_PCUTOFF),
     px_per_mm: float | None = Form(None),
 ):
     tmp_path = _save_upload_to_temp(file)
     try:
-        result = analyze_video_file(tmp_path, sample_fps, pcutoff, px_per_mm)
+        results = analyze_video_file(tmp_path, sample_fps, pcutoff, px_per_mm)
         # Preserve the original uploaded filename rather than the temp name.
-        result["video"] = file.filename or result["video"]
-        return result
+        for result in results:
+            result["video"] = file.filename or result["video"]
+        return {"video": file.filename or os.path.basename(tmp_path), "worms": results}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     finally:
@@ -600,16 +1183,17 @@ async def analyze(
 async def analyze_batch(
     files: list[UploadFile] = File(...),
     sample_fps: float = Form(10.0),
-    pcutoff: float = Form(0.5),
+    pcutoff: float = Form(DEFAULT_PCUTOFF),
     px_per_mm: float | None = Form(None),
 ):
     results: list[dict] = []
     for upload in files:
         tmp_path = _save_upload_to_temp(upload)
         try:
-            res = analyze_video_file(tmp_path, sample_fps, pcutoff, px_per_mm)
-            res["video"] = upload.filename or res["video"]
-            results.append(res)
+            video_results = analyze_video_file(tmp_path, sample_fps, pcutoff, px_per_mm)
+            for res in video_results:
+                res["video"] = upload.filename or res["video"]
+                results.append(res)
         except HTTPException:
             # Model not ready — this is fatal for the whole batch, not per-video.
             _safe_unlink(tmp_path)
