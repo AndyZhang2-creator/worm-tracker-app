@@ -705,58 +705,119 @@ def _resize_for_preview(frame, max_width: int):
     return image, scale
 
 
-def _annotate_detection_frame(frame, candidates: list[dict]):
-    image, scale = _resize_for_preview(frame, LIVE_FRAME_MAX_WIDTH)
-    selected_color = (168, 231, 110)
-    muted_color = (132, 144, 152)
-    endpoint_color = (61, 163, 232)
+WORM_COLORS = [
+    (168, 231, 110),  # green  (#6EE7A8)
+    (61, 163, 232),   # amber  (#E8A33D)
+    (240, 180, 110),  # blue
+    (200, 120, 255),  # magenta
+    (140, 255, 200),  # teal
+]
 
-    # Candidates are sorted by confidence desc; only label the top worms so the
-    # live preview shows real worms, not the model's low-confidence noise.
-    shown = (candidates or [])[:MAX_WORMS_PER_VIDEO]
-    for det_i, candidate in enumerate(shown, start=1):
-        keypoints = candidate.get("keypoints") or []
-        center = _candidate_center(candidate)
-        color = selected_color if det_i <= MAX_WORMS_PER_VIDEO else muted_color
-        thickness = 2 if det_i <= MAX_WORMS_PER_VIDEO else 1
+
+def _worm_color(worm_id: int):
+    return WORM_COLORS[(int(worm_id) - 1) % len(WORM_COLORS)]
+
+
+class _LiveWormTracker:
+    """
+    Assigns STABLE worm ids to detections as frames stream in, mirroring the
+    batch identity logic (_select_same_worm_tracks): seed ids on the first frame
+    with detections (by confidence), then match each later frame one-to-one by
+    nearest center. This stops a worm's id from flipping frame to frame in the
+    live preview, and the ids line up with the final per-worm results.
+    """
+
+    def __init__(self, max_tracks: int):
+        self.max_tracks = max_tracks
+        self.tracks = []  # [{worm_id, last_center}]
+        self.seeded = False
+
+    def update(self, candidates):
+        if not self.seeded:
+            seeds = _top_seed_candidates(candidates, self.max_tracks)
+            if not seeds:
+                return []
+            self.tracks = [
+                {"worm_id": i, "last_center": _candidate_center(seed)}
+                for i, seed in enumerate(seeds, start=1)
+            ]
+            self.seeded = True
+            return [(seed, t["worm_id"]) for seed, t in zip(seeds, self.tracks)]
+
+        viable = [c for c in (candidates or []) if c.get("keypoints") and _candidate_center(c) is not None]
+        pairs = []
+        for ti, track in enumerate(self.tracks):
+            for ci, candidate in enumerate(viable):
+                pairs.append((
+                    _distance_sq(track["last_center"], _candidate_center(candidate)),
+                    -_safe_float(candidate.get("confidence"), 0.0),
+                    ti, ci,
+                ))
+        assigned_t, assigned_c, out_map = set(), set(), {}
+        for _, _, ti, ci in sorted(pairs):
+            if ti in assigned_t or ci in assigned_c:
+                continue
+            dist_sq = _distance_sq(self.tracks[ti]["last_center"], _candidate_center(viable[ci]))
+            if MAX_MATCH_DISTANCE_PX > 0 and dist_sq > MAX_MATCH_DISTANCE_PX ** 2:
+                continue
+            assigned_t.add(ti); assigned_c.add(ci); out_map[ti] = ci
+
+        labeled = []
+        for ti, track in enumerate(self.tracks):
+            ci = out_map.get(ti)
+            if ci is None:
+                continue
+            candidate = viable[ci]
+            track["last_center"] = _candidate_center(candidate)
+            labeled.append((candidate, track["worm_id"]))
+        return labeled
+
+
+def _annotate_live_frame(frame, labeled: list):
+    """labeled: list of (candidate, worm_id) carrying STABLE ids across frames."""
+    image, scale = _resize_for_preview(frame, LIVE_FRAME_MAX_WIDTH)
+    endpoint_color = (61, 163, 232)
+    if not labeled:
+        _draw_label(image, "no worm detected", 12, 28, (132, 144, 152), False)
+        return image
+
+    for candidate, worm_id in labeled:
+        color = _worm_color(worm_id)
         points = []
-        for kp in keypoints:
+        for kp in candidate.get("keypoints") or []:
             xy = _kp_xy(kp)
             if xy is None:
                 continue
-            px, py = int(round(xy[0] * scale)), int(round(xy[1] * scale))
-            points.append((px, py, kp))
+            points.append((int(round(xy[0] * scale)), int(round(xy[1] * scale)), kp))
 
         if len(points) >= 2:
             for i in range(len(points) - 1):
-                cv2.line(image, points[i][:2], points[i + 1][:2], color, thickness, cv2.LINE_AA)
-
+                cv2.line(image, points[i][:2], points[i + 1][:2], color, 2, cv2.LINE_AA)
         for px, py, kp in points:
             cv2.circle(image, (px, py), 4, color, thickness=-1, lineType=cv2.LINE_AA)
             cv2.circle(image, (px, py), 6, (18, 21, 24), thickness=1, lineType=cv2.LINE_AA)
             if len(kp) > 3 and kp[3]:
                 _draw_label(image, str(kp[3])[:16], px + 7, py - 7, endpoint_color, False)
 
+        center = _candidate_center(candidate)
         if center is not None:
             conf = _round_or_none(candidate.get("confidence"))
-            label = f"det {det_i}" + (f" {conf:.2f}" if conf is not None else "")
+            label = f"worm {worm_id}" + (f" {conf:.2f}" if conf is not None else "")
             cx, cy = center
-            _draw_label(image, label, cx * scale + 8, cy * scale - 12, color, det_i <= MAX_WORMS_PER_VIDEO)
-
-    if not candidates:
-        _draw_label(image, "no detections", 12, 28, muted_color, False)
-
+            _draw_label(image, label, cx * scale + 8, cy * scale - 12, color, True)
     return image
 
 
-def _live_frame_payload(frame, candidates: list[dict], frame_index: int, analyzed_index: int, native_fps: float):
-    annotated = _annotate_detection_frame(frame, candidates)
+def _live_frame_payload(frame, labeled: list, frame_index: int, analyzed_index: int, native_fps: float):
+    annotated = _annotate_live_frame(frame, labeled)
     data_url = _encode_jpeg_data_url(annotated, quality=LIVE_FRAME_JPEG_QUALITY)
+    worm_ids = [int(worm_id) for _, worm_id in labeled]
     return {
         "frame_index": int(frame_index),
         "analyzed_index": int(analyzed_index),
         "time_s": round(frame_index / native_fps, 3) if native_fps else None,
-        "detections": min(len(candidates or []), MAX_WORMS_PER_VIDEO),
+        "detections": len(labeled),
+        "worm_ids": worm_ids,
         "image": data_url,
     }
 
@@ -1015,6 +1076,7 @@ def analyze_video_file(path: str, sample_fps: float, pcutoff: float, px_per_mm, 
     # Sequential read + skip; only run inference every step-th frame. Keep ALL
     # worm candidates until the identity tracker chooses one continuous worm.
     frames_candidates = []  # each: list[candidate]
+    live_tracker = _LiveWormTracker(MAX_WORMS_PER_VIDEO) if progress_callback else None
     frame_idx = 0
     analyzed_idx = 0
     while True:
@@ -1024,12 +1086,13 @@ def analyze_video_file(path: str, sample_fps: float, pcutoff: float, px_per_mm, 
         if frame_idx % step == 0:
             candidates = detect(frame) or []
             frames_candidates.append(candidates)
+            labeled = live_tracker.update(candidates) if live_tracker else []
             if progress_callback and analyzed_idx % LIVE_FRAME_EVERY_N == 0:
                 progress_callback({
                     "type": "frame",
                     **_live_frame_payload(
                         frame=frame,
-                        candidates=candidates,
+                        labeled=labeled,
                         frame_index=frame_idx,
                         analyzed_index=analyzed_idx,
                         native_fps=native_fps,

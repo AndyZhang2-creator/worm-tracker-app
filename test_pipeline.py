@@ -148,6 +148,7 @@ def main():
     frame_event = next(event for event in progress_events if event["type"] == "frame")
     assert frame_event["image"].startswith("data:image/jpeg;base64,"), frame_event.keys()
     assert frame_event["detections"] == 1, frame_event
+    assert frame_event["worm_ids"] == [1], frame_event
     assert streamed_rows[0]["avg_speed_px_s"] == r30["avg_speed_px_s"]
     print("OK: live progress events include annotated model-detection frames")
     # Both worm endpoints are tracked; one is auto-selected as "the farthest".
@@ -265,6 +266,13 @@ def test_roboflow_parser():
     ])
     assert same_worm_track[1][0][0] == 107.0, same_worm_track
     print("OK: same-worm tracking — nearest center beats per-frame confidence jump")
+
+    live_tracker = app._LiveWormTracker(max_tracks=2)
+    live_seed = live_tracker.update([cand(100, 0.90, "worm-a"), cand(200, 0.80, "worm-b")])
+    live_later = live_tracker.update([cand(204, 0.99, "worm-b"), cand(104, 0.20, "worm-a")])
+    assert [(round(app._candidate_center(c)[0]), worm_id) for c, worm_id in live_seed] == [(100, 1), (200, 2)]
+    assert [(round(app._candidate_center(c)[0]), worm_id) for c, worm_id in live_later] == [(104, 1), (204, 2)]
+    print("OK: live preview labels keep stable worm ids when confidence rank changes")
 
     seeded = [cand(100 + i * 40, 0.90 - i * 0.05, f"seed-{i}") for i in range(5)]
     lower_seed = cand(340, 0.10, "not-seeded")

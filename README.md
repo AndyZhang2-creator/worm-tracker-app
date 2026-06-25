@@ -127,12 +127,14 @@ Then open <http://localhost:8000>.
    - **px_per_mm** (optional) — leave blank to stay in pixels; set it to convert
      every speed/distance to millimetres.
 3. Click **Analyze**. While the run is in progress, the page shows each sampled
-   frame as it comes back from the model with detected endpoints labeled. When
-   the run finishes, a summary banner shows the headline numbers, results appear
-   in a table, and clicking any row shows the labeled tracking frame for that
-   worm, draws that video's speed-over-time chart, shows a one-second
-   average-speed table, and adds an amber marker at the moment the tail was
-   farthest from start.
+   frame as it comes back from the model with stable `worm 1`, `worm 2`, etc.
+   labels. Those labels are seeded once and then matched by nearest center, so a
+   worm does not get renamed just because confidence order changes. When the run
+   finishes, a summary banner shows the headline numbers, results appear in a
+   table, and clicking any row shows the labeled tracking frame for that worm,
+   draws that video's speed-over-time chart, shows a one-second average-speed
+   table, and adds an amber marker at the moment the tail was farthest from
+   start.
 4. After a batch run, **Download CSV** exports one row per worm/video, including
    per-second average speed columns.
 

@@ -473,11 +473,15 @@
       const total = event.frames_to_analyze ? Number(event.frames_to_analyze) : null;
       const pct = total ? Math.max(0, Math.min(100, (analyzed / total) * 100)) : 0;
       liveProgressBar.style.width = pct ? pct.toFixed(1) + "%" : "18%";
+      const wormIds = Array.isArray(event.worm_ids) && event.worm_ids.length
+        ? " | worms " + event.worm_ids.join(", ")
+        : " | no tracked worms";
       $("liveStatus").textContent = "Analyzing " + (event.video || "video");
       $("liveMeta").textContent =
         "video " + event.video_index + "/" + event.video_total +
         " | time " + fmt(event.time_s) + "s" +
-        (total ? " | sampled " + analyzed + "/" + total : " | sampled " + analyzed);
+        (total ? " | sampled " + analyzed + "/" + total : " | sampled " + analyzed) +
+        wormIds;
       $("liveFrame").textContent = event.frame_index ?? "n/a";
       $("liveDetections").textContent = event.detections ?? 0;
       return;
