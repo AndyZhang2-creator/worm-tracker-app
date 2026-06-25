@@ -24,16 +24,19 @@ Model contract (fixed — see build spec §2):
 import base64
 import csv
 import io
+import json
 import os
+import queue
 import secrets
 import tempfile
+import threading
 from pathlib import Path
 
 import cv2
 import httpx
 import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from speed_utils import compute_displacement, compute_track_speed
@@ -150,6 +153,9 @@ MAX_WORMS_PER_VIDEO = max(1, int(_float_env("WORM_MAX_TRACKS", 5)))
 MAX_MATCH_DISTANCE_PX = _float_env("WORM_MAX_MATCH_DISTANCE_PX", 150.0)
 TRACKING_FRAME_MAX_WIDTH = max(320, int(_float_env("WORM_TRACKING_FRAME_MAX_WIDTH", 900)))
 TRACKING_FRAME_JPEG_QUALITY = min(95, max(50, int(_float_env("WORM_TRACKING_FRAME_JPEG_QUALITY", 85))))
+LIVE_FRAME_MAX_WIDTH = max(320, int(_float_env("WORM_LIVE_FRAME_MAX_WIDTH", 720)))
+LIVE_FRAME_JPEG_QUALITY = min(95, max(45, int(_float_env("WORM_LIVE_FRAME_JPEG_QUALITY", 75))))
+LIVE_FRAME_EVERY_N = max(1, int(_float_env("WORM_LIVE_FRAME_EVERY_N", 1)))
 
 # Optional escape hatch for the older direct-model backend. The default is now
 # the serverless Roboflow workflow requested by the user.
@@ -677,11 +683,11 @@ def _draw_label(image, text: str, x: float, y: float, color, selected: bool) -> 
     cv2.putText(image, text, (ix + pad, iy), font, scale, color, thickness, cv2.LINE_AA)
 
 
-def _encode_jpeg_data_url(image) -> str | None:
+def _encode_jpeg_data_url(image, quality: int = TRACKING_FRAME_JPEG_QUALITY) -> str | None:
     ok, buf = cv2.imencode(
         ".jpg",
         image,
-        [int(cv2.IMWRITE_JPEG_QUALITY), TRACKING_FRAME_JPEG_QUALITY],
+        [int(cv2.IMWRITE_JPEG_QUALITY), quality],
     )
     if not ok:
         return None
@@ -689,13 +695,71 @@ def _encode_jpeg_data_url(image) -> str | None:
     return f"data:image/jpeg;base64,{b64}"
 
 
-def _annotate_tracking_frame(frame, tracks: list[dict], selected_worm_id: int):
+def _resize_for_preview(frame, max_width: int):
     image = frame.copy()
     scale = 1.0
-    if image.shape[1] > TRACKING_FRAME_MAX_WIDTH:
-        scale = TRACKING_FRAME_MAX_WIDTH / image.shape[1]
-        new_size = (TRACKING_FRAME_MAX_WIDTH, max(1, int(round(image.shape[0] * scale))))
+    if image.shape[1] > max_width:
+        scale = max_width / image.shape[1]
+        new_size = (max_width, max(1, int(round(image.shape[0] * scale))))
         image = cv2.resize(image, new_size, interpolation=cv2.INTER_AREA)
+    return image, scale
+
+
+def _annotate_detection_frame(frame, candidates: list[dict]):
+    image, scale = _resize_for_preview(frame, LIVE_FRAME_MAX_WIDTH)
+    selected_color = (168, 231, 110)
+    muted_color = (132, 144, 152)
+    endpoint_color = (61, 163, 232)
+
+    for det_i, candidate in enumerate(candidates or [], start=1):
+        keypoints = candidate.get("keypoints") or []
+        center = _candidate_center(candidate)
+        color = selected_color if det_i <= MAX_WORMS_PER_VIDEO else muted_color
+        thickness = 2 if det_i <= MAX_WORMS_PER_VIDEO else 1
+        points = []
+        for kp in keypoints:
+            xy = _kp_xy(kp)
+            if xy is None:
+                continue
+            px, py = int(round(xy[0] * scale)), int(round(xy[1] * scale))
+            points.append((px, py, kp))
+
+        if len(points) >= 2:
+            for i in range(len(points) - 1):
+                cv2.line(image, points[i][:2], points[i + 1][:2], color, thickness, cv2.LINE_AA)
+
+        for px, py, kp in points:
+            cv2.circle(image, (px, py), 4, color, thickness=-1, lineType=cv2.LINE_AA)
+            cv2.circle(image, (px, py), 6, (18, 21, 24), thickness=1, lineType=cv2.LINE_AA)
+            if len(kp) > 3 and kp[3]:
+                _draw_label(image, str(kp[3])[:16], px + 7, py - 7, endpoint_color, False)
+
+        if center is not None:
+            conf = _round_or_none(candidate.get("confidence"))
+            label = f"det {det_i}" + (f" {conf:.2f}" if conf is not None else "")
+            cx, cy = center
+            _draw_label(image, label, cx * scale + 8, cy * scale - 12, color, det_i <= MAX_WORMS_PER_VIDEO)
+
+    if not candidates:
+        _draw_label(image, "no detections", 12, 28, muted_color, False)
+
+    return image
+
+
+def _live_frame_payload(frame, candidates: list[dict], frame_index: int, analyzed_index: int, native_fps: float):
+    annotated = _annotate_detection_frame(frame, candidates)
+    data_url = _encode_jpeg_data_url(annotated, quality=LIVE_FRAME_JPEG_QUALITY)
+    return {
+        "frame_index": int(frame_index),
+        "analyzed_index": int(analyzed_index),
+        "time_s": round(frame_index / native_fps, 3) if native_fps else None,
+        "detections": len(candidates or []),
+        "image": data_url,
+    }
+
+
+def _annotate_tracking_frame(frame, tracks: list[dict], selected_worm_id: int):
+    image, scale = _resize_for_preview(frame, TRACKING_FRAME_MAX_WIDTH)
 
     selected_color = (168, 231, 110)  # #6EE7A8, BGR for OpenCV
     muted_color = (132, 144, 152)
@@ -914,7 +978,7 @@ def _analyze_worm_track(
     }
 
 
-def analyze_video_file(path: str, sample_fps: float, pcutoff: float, px_per_mm):
+def analyze_video_file(path: str, sample_fps: float, pcutoff: float, px_per_mm, progress_callback=None):
     """
     Run inference over one video and return one result dict per tracked worm.
 
@@ -933,17 +997,43 @@ def analyze_video_file(path: str, sample_fps: float, pcutoff: float, px_per_mm):
         native_fps = 30.0
     step = max(1, round(native_fps / sample_fps))
     effective_fps = native_fps / step  # <- THIS goes into compute_track_speed
+    total_frames_raw = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    frames_to_analyze = int(np.ceil(total_frames_raw / step)) if total_frames_raw > 0 else None
+    if progress_callback:
+        progress_callback({
+            "type": "video_start",
+            "native_fps": round(float(native_fps), 3),
+            "effective_fps": round(float(effective_fps), 3),
+            "total_frames": total_frames_raw or None,
+            "frames_to_analyze": frames_to_analyze,
+            "sample_step": step,
+        })
 
     # Sequential read + skip; only run inference every step-th frame. Keep ALL
     # worm candidates until the identity tracker chooses one continuous worm.
     frames_candidates = []  # each: list[candidate]
     frame_idx = 0
+    analyzed_idx = 0
     while True:
         ok, frame = cap.read()
         if not ok:
             break
         if frame_idx % step == 0:
-            frames_candidates.append(detect(frame) or [])
+            candidates = detect(frame) or []
+            frames_candidates.append(candidates)
+            if progress_callback and analyzed_idx % LIVE_FRAME_EVERY_N == 0:
+                progress_callback({
+                    "type": "frame",
+                    **_live_frame_payload(
+                        frame=frame,
+                        candidates=candidates,
+                        frame_index=frame_idx,
+                        analyzed_index=analyzed_idx,
+                        native_fps=native_fps,
+                    ),
+                    "frames_to_analyze": frames_to_analyze,
+                })
+            analyzed_idx += 1
         frame_idx += 1
     cap.release()
 
@@ -980,6 +1070,12 @@ def analyze_video_file(path: str, sample_fps: float, pcutoff: float, px_per_mm):
 
     if not results:
         raise ValueError("No worm/keypoints were ever detected in this video.")
+    if progress_callback:
+        progress_callback({
+            "type": "video_done",
+            "frames_analyzed": frames_analyzed,
+            "worm_count": len(results),
+        })
     return results
 
 
@@ -1211,6 +1307,99 @@ async def analyze_batch(
         "csv_token": token,
         "summary": _batch_summary(results, used_mm=bool(px_per_mm)),
     }
+
+
+def _json_line(event: dict) -> str:
+    return json.dumps(event, separators=(",", ":")) + "\n"
+
+
+@app.post("/api/analyze-stream")
+async def analyze_stream(
+    files: list[UploadFile] = File(...),
+    sample_fps: float = Form(10.0),
+    pcutoff: float = Form(DEFAULT_PCUTOFF),
+    px_per_mm: float | None = Form(None),
+):
+    jobs = []
+    for upload in files:
+        jobs.append({
+            "name": upload.filename or "unknown",
+            "path": _save_upload_to_temp(upload),
+        })
+
+    def event_stream():
+        events: queue.Queue = queue.Queue(maxsize=8)
+        sentinel = object()
+
+        def put(event: dict) -> None:
+            events.put(event)
+
+        def worker() -> None:
+            results: list[dict] = []
+            try:
+                for video_i, job in enumerate(jobs, start=1):
+                    name = job["name"]
+                    path = job["path"]
+
+                    def progress(event: dict, video_name=name, index=video_i) -> None:
+                        payload = dict(event)
+                        payload["video"] = video_name
+                        payload["video_index"] = index
+                        payload["video_total"] = len(jobs)
+                        put(payload)
+
+                    try:
+                        video_results = analyze_video_file(
+                            path,
+                            sample_fps=sample_fps,
+                            pcutoff=pcutoff,
+                            px_per_mm=px_per_mm,
+                            progress_callback=progress,
+                        )
+                        for res in video_results:
+                            res["video"] = name
+                            results.append(res)
+                    except HTTPException as exc:
+                        put({"type": "fatal_error", "detail": exc.detail})
+                        return
+                    except Exception as exc:  # noqa: BLE001 - keep batch behavior
+                        error = str(exc)
+                        results.append({"video": name, "error": error})
+                        put({
+                            "type": "video_error",
+                            "video": name,
+                            "video_index": video_i,
+                            "video_total": len(jobs),
+                            "error": error,
+                        })
+
+                csv_text = _build_csv(results, used_calibration=bool(px_per_mm))
+                token = secrets.token_hex(16)
+                _CSV_STORE[token] = csv_text
+                put({
+                    "type": "done",
+                    "results": results,
+                    "csv_token": token,
+                    "summary": _batch_summary(results, used_mm=bool(px_per_mm)),
+                })
+            finally:
+                for job in jobs:
+                    _safe_unlink(job["path"])
+                put(sentinel)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+        while True:
+            event = events.get()
+            if event is sentinel:
+                break
+            yield _json_line(event)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="application/x-ndjson",
+        headers={"Cache-Control": "no-cache"},
+    )
 
 
 @app.get("/api/download/{token}")

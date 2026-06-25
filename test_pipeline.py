@@ -132,6 +132,24 @@ def main():
     preview_bytes = base64.b64decode(r30["tracking_frame_image"].split(",", 1)[1])
     assert len(preview_bytes) > 1000
     print("OK: labeled tracking-frame preview returned with worm result")
+
+    progress_events = []
+    streamed_rows = app.analyze_video_file(
+        v30,
+        sample_fps=10.0,
+        pcutoff=0.5,
+        px_per_mm=None,
+        progress_callback=progress_events.append,
+    )
+    event_types = [event["type"] for event in progress_events]
+    assert event_types[0] == "video_start", event_types
+    assert "frame" in event_types, event_types
+    assert event_types[-1] == "video_done", event_types
+    frame_event = next(event for event in progress_events if event["type"] == "frame")
+    assert frame_event["image"].startswith("data:image/jpeg;base64,"), frame_event.keys()
+    assert frame_event["detections"] == 1, frame_event
+    assert streamed_rows[0]["avg_speed_px_s"] == r30["avg_speed_px_s"]
+    print("OK: live progress events include annotated model-detection frames")
     # Both worm endpoints are tracked; one is auto-selected as "the farthest".
     assert len(r30["endpoints"]) == 2, r30["endpoints"]
     assert r30["tracked_endpoint_index"] in (0, 1)

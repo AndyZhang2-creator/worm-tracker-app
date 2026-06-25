@@ -59,6 +59,7 @@ WORM_PCUTOFF=0.30             # low-confidence keypoints become tracking gaps
 WORM_MAX_TRACKS=5             # seed and track up to five worms per video
 WORM_MAX_MATCH_DISTANCE_PX=150  # far detections become gaps instead of swaps
 WORM_TRACKING_FRAME_MAX_WIDTH=900  # max width of the labeled preview image
+WORM_LIVE_FRAME_MAX_WIDTH=720      # max width of the live detection preview
 WORM_ENDPOINT_INDEX=0         # pin a specific endpoint (0 or 1) instead of auto
 ROBOFLOW_TAIL_KEYPOINT=tail   # ...or pin the endpoint by class name
 ```
@@ -125,9 +126,11 @@ Then open <http://localhost:8000>.
      *untracked* (a gap), not as zero movement (see "Why gaps" below).
    - **px_per_mm** (optional) — leave blank to stay in pixels; set it to convert
      every speed/distance to millimetres.
-3. Click **Analyze**. A summary banner shows the headline numbers, results
-   appear in a table, and clicking any row shows the labeled tracking frame for
-   that worm, draws that video's speed-over-time chart, shows a one-second
+3. Click **Analyze**. While the run is in progress, the page shows each sampled
+   frame as it comes back from the model with detected endpoints labeled. When
+   the run finishes, a summary banner shows the headline numbers, results appear
+   in a table, and clicking any row shows the labeled tracking frame for that
+   worm, draws that video's speed-over-time chart, shows a one-second
    average-speed table, and adds an amber marker at the moment the tail was
    farthest from start.
 4. After a batch run, **Download CSV** exports one row per worm/video, including
@@ -188,6 +191,7 @@ Both corrupt the data. The only correct behavior is to skip the interval. See
 |--------|------------------------|--------------------------------------------|
 | POST   | `/api/analyze`         | Analyze one video; returns a `worms` array.|
 | POST   | `/api/analyze-batch`   | Analyze many videos; returns flattened worm rows and a `csv_token`.|
+| POST   | `/api/analyze-stream`  | Analyze many videos as NDJSON progress events, including live detection frames, then final results.|
 | GET    | `/api/download/{token}`| Download the batch summary CSV.            |
 | GET    | `/api/model-status`    | `{ "ready": true }` or a reason it isn't.  |
 
