@@ -975,8 +975,7 @@ def _analyze_worm_track(
                 if not endpoint_names[k] and len(kp) > 3 and kp[3]:
                     endpoint_names[k] = kp[3]
 
-    # Per-endpoint displacement, then choose which endpoint to report: by
-    # default the one that moved the most ("the farthest tail").
+    # Per-endpoint displacement (kept for reference in the response).
     per_endpoint = []
     for k in range(n_kp):
         kxs, kys, kconfs = tracks[k]
@@ -987,8 +986,22 @@ def _analyze_worm_track(
             "farthest_displacement_px": _round_or_none(kd["farthest_displacement_px"]),
             "net_displacement_px": _round_or_none(kd["net_displacement_px"]),
         })
-    chosen = _choose_endpoint(per_endpoint)
-    xs, ys, confs = tracks[chosen]
+
+    # Track the worm's CENTER: the midpoint of its two endpoints each frame, and
+    # measure the distance/speed that center travels. The midpoint is only
+    # trusted when BOTH endpoints are present, so its confidence is the min of
+    # the two (a missing/low-confidence end -> NaN gap, never a fake point).
+    xs, ys, confs = [], [], []
+    for f in frames_kps:
+        pts = [kp for kp in (f or []) if kp is not None and len(kp) >= 3]
+        if len(pts) >= 2:
+            xs.append((pts[0][0] + pts[1][0]) / 2.0)
+            ys.append((pts[0][1] + pts[1][1]) / 2.0)
+            confs.append(min(pts[0][2], pts[1][2]))
+        elif len(pts) == 1:
+            xs.append(pts[0][0]); ys.append(pts[0][1]); confs.append(pts[0][2])
+        else:
+            xs.append(np.nan); ys.append(np.nan); confs.append(0.0)
 
     metrics = compute_track_speed(
         xs, ys, confs, fps=effective_fps, pcutoff=pcutoff, px_per_mm=px_per_mm
@@ -1028,8 +1041,8 @@ def _analyze_worm_track(
         "farthest_displacement_px": _round_or_none(disp["farthest_displacement_px"]),
         "net_displacement_px": _round_or_none(disp["net_displacement_px"]),
         "farthest_displacement_time_s": far_time,
-        "tracked_endpoint_index": chosen,
-        "tracked_endpoint_name": endpoint_names[chosen] or f"kp{chosen}",
+        "tracked_point": "center",
+        "tracked_endpoint_name": "center (midpoint of endpoints)",
         "endpoints": per_endpoint,
         "speed_series_px_s": metrics["speed_series_px_s"],
         "per_second_speed": per_second_speed,

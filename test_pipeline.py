@@ -151,12 +151,13 @@ def main():
     assert frame_event["worm_ids"] == [1], frame_event
     assert streamed_rows[0]["avg_speed_px_s"] == r30["avg_speed_px_s"]
     print("OK: live progress events include annotated model-detection frames")
-    # Both worm endpoints are tracked; one is auto-selected as "the farthest".
+    # Both endpoints are reported for reference, but the tracked point is the
+    # CENTER (midpoint of the two endpoints), and we measure how far it travels.
     assert len(r30["endpoints"]) == 2, r30["endpoints"]
-    assert r30["tracked_endpoint_index"] in (0, 1)
-    print(f"OK: tail displacement — farthest {r30['farthest_displacement_px']}px @ "
+    assert r30["tracked_point"] == "center", r30.get("tracked_point")
+    print(f"OK: center-midpoint displacement — farthest {r30['farthest_displacement_px']}px @ "
           f"{r30['farthest_displacement_time_s']}s, net {r30['net_displacement_px']}px "
-          f"(tracked endpoint #{r30['tracked_endpoint_index']} of {len(r30['endpoints'])})")
+          f"(tracking {r30['tracked_endpoint_name']})")
 
     # Calibration switches units.
     rc = app.analyze_video_file(v30, sample_fps=10.0, pcutoff=0.5, px_per_mm=10.0)[0]
