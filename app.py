@@ -151,6 +151,11 @@ RF_MODEL_TIMEOUT_S = _float_env("ROBOFLOW_MODEL_TIMEOUT_S", 120.0)
 DEFAULT_PCUTOFF = _float_env("WORM_PCUTOFF", RF_CONFIDENCE)
 MAX_WORMS_PER_VIDEO = max(1, int(_float_env("WORM_MAX_TRACKS", 5)))
 MAX_MATCH_DISTANCE_PX = _float_env("WORM_MAX_MATCH_DISTANCE_PX", 150.0)
+# Light moving-average smoothing of the center trajectory before measuring
+# speed. Tracking jitter only ever ADDS to summed path length (displacement is
+# always >= 0), so unsmoothed speed reads a bit high; a small window damps that.
+# Odd window in analyzed frames; 1 = off. Tune up if speed still overshoots.
+SMOOTH_WINDOW = max(1, int(_float_env("WORM_SMOOTH_WINDOW", 3)))
 # Overlap tolerance for de-duplicating the model's boxes: if two detections
 # overlap by more than this fraction of the smaller box, keep only the most
 # confident one. Adjustable per request; 0.9 = merge boxes overlapping >90%.
@@ -1026,6 +1031,30 @@ def _tracking_frame_payloads(path: str, tracks: list[dict], native_fps: float, s
     return payloads
 
 
+def _smooth_positions(xs, ys, window: int):
+    """
+    Centered moving average of the position series over an odd `window`,
+    ignoring NaN gaps. A position that is itself NaN (untracked) stays NaN, so
+    gaps are preserved and the NaN-gap speed logic is unaffected. Damps tracking
+    jitter, which otherwise biases speed upward (summed |displacement| only grows
+    with noise). window <= 1 returns the series unchanged.
+    """
+    xs = np.asarray(xs, dtype=float)
+    ys = np.asarray(ys, dtype=float)
+    if window is None or window <= 1 or len(xs) == 0:
+        return xs, ys
+    r = window // 2
+    n = len(xs)
+    sx, sy = xs.copy(), ys.copy()
+    for i in range(n):
+        if np.isnan(xs[i]) or i - r < 0 or i + r + 1 > n:
+            continue  # keep gaps as gaps; leave array-edge points unsmoothed
+        with np.errstate(invalid="ignore"):
+            sx[i] = np.nanmean(xs[i - r:i + r + 1])
+            sy[i] = np.nanmean(ys[i - r:i + r + 1])
+    return sx, sy
+
+
 def _analyze_worm_track(
     path: str,
     track: dict,
@@ -1078,6 +1107,9 @@ def _analyze_worm_track(
             xs.append(np.nan); ys.append(np.nan); confs.append(0.0)
         else:
             xs.append(c[0]); ys.append(c[1]); confs.append(c[2])
+
+    # Damp tracking jitter (which biases speed upward) before measuring.
+    xs, ys = _smooth_positions(xs, ys, SMOOTH_WINDOW)
 
     metrics = compute_track_speed(xs, ys, confs, fps=effective_fps, pcutoff=pcutoff, px_per_mm=px_per_mm)
     disp = compute_displacement(xs, ys, confs, pcutoff=pcutoff, px_per_mm=px_per_mm)

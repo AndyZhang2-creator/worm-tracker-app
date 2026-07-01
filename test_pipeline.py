@@ -209,6 +209,7 @@ def main():
     print(csv_px.strip())
 
     # ---- Roboflow workflow parser (offline, mocked response) ---------------- #
+    test_smoothing_damps_jitter()
     test_speed_gaps_do_not_bridge()
     test_roboflow_parser()
     test_overlap_dedupe()
@@ -228,6 +229,24 @@ def test_overlap_dedupe():
     assert [c["confidence"] for c in kept] == [0.9, 0.7], kept
     assert len(app._dedupe_overlapping([c_hi, c_dup, c_far], 1.0)) == 3  # disabled
     print("OK: overlap dedup — keeps highest-confidence of overlapping boxes, tol=1 off")
+
+
+def test_smoothing_damps_jitter():
+    """Smoothing must damp pure jitter but leave a straight track's speed intact."""
+    # Pure back-and-forth jitter with no net motion: smoothing should shrink it.
+    jx = [0.0, 6.0, 0.0, 6.0, 0.0, 6.0, 0.0]
+    zy = [0.0] * len(jx)
+    raw = app.compute_track_speed(jx, zy, [0.9] * len(jx), fps=1.0)["avg_speed_px_s"]
+    sx, sy = app._smooth_positions(jx, zy, 3)
+    smoothed = app.compute_track_speed(list(sx), list(sy), [0.9] * len(jx), fps=1.0)["avg_speed_px_s"]
+    assert smoothed < raw, (smoothed, raw)
+
+    # A constant-velocity track is unchanged (interior full-window mean of a line
+    # is the line; endpoints are left as-is).
+    line = [float(i * 5) for i in range(6)]
+    lx, ly = app._smooth_positions(line, [0.0] * 6, 3)
+    assert list(lx) == line, list(lx)
+    print(f"OK: smoothing damps jitter ({raw:.1f} -> {smoothed:.1f} px/s), keeps a straight track")
 
 
 def test_speed_gaps_do_not_bridge():
