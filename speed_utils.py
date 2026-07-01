@@ -13,21 +13,19 @@ data (known displacement per frame, recovered exactly). Do NOT redesign it.
 import numpy as np
 
 
-def compute_track_speed(xs, ys, confs, pcutoff=0.5, px_per_mm=None):
+def compute_track_speed(xs, ys, confs, fps, pcutoff=0.5, px_per_mm=None):
     """
-    xs, ys, confs: 1D arrays, one value per analyzed frame, for ONE keypoint
-        (e.g. the tail).
+    xs, ys, confs: 1D arrays, one value per analyzed frame, for ONE point
+        (here: the worm's center).
+    fps: the EFFECTIVE sampling fps actually used between consecutive analyzed
+        frames (native_video_fps / frame_step), not necessarily the video's
+        native fps. Speed is reported per SECOND, so this converts per-frame
+        displacement into a rate.
     pcutoff: frames below this confidence become NaN (untracked), not
         zero displacement. This is the single most important correctness
         rule in this whole app: a low-confidence frame must NEVER be
         treated as "the worm didn't move." It must create a gap that's
         excluded from the average, not a fake zero or a fake jump.
-
-    Speed here is PIXELS PER FRAME: the straight-line distance the keypoint
-    moves between two consecutive analyzed frames. (One "frame" is one sampled
-    step, i.e. spaced native_fps / frame_step apart — not necessarily one native
-    video frame.) Per-frame speed is exactly the per-interval displacement, so
-    speed and distance are the same numbers here.
 
     Why NaN-gaps matter:
         If we instead zero-filled or carried-forward a missed frame, a single
@@ -37,10 +35,11 @@ def compute_track_speed(xs, ys, confs, pcutoff=0.5, px_per_mm=None):
         data. Skipping the interval entirely is the only correct behavior.
 
         Verified with this test case (frame 4 deliberately low-confidence, worm
-        moving at a constant 5 px/frame):
-            speeds (px/frame): [5, 5, 5, nan, nan, 5, 5, 5, 5]
-            mean speed ignoring gaps: 5.0  <- exactly correct, unaffected by
-                                             the bad frame.
+        moving at a constant 5 px/frame, 10fps):
+            distances:        [5, 5, 5, nan, nan, 5, 5, 5, 5]
+            speeds (px/s):    [50, 50, 50, nan, nan, 50, 50, 50, 50]
+            mean speed ignoring gaps: 50.0  <- exactly correct, unaffected by
+                                              the bad frame.
 
         np.diff across a NaN naturally produces NaN on BOTH adjacent intervals
         (the interval entering the bad frame and the interval leaving it), and
@@ -57,20 +56,21 @@ def compute_track_speed(xs, ys, confs, pcutoff=0.5, px_per_mm=None):
     x = np.where(valid, xs, np.nan)
     y = np.where(valid, ys, np.nan)
 
-    # Euclidean per-frame displacement in pixels = speed in px/frame. A NaN at
-    # either end of an interval makes that interval NaN, so it is excluded below.
+    # Euclidean per-interval displacement in pixels. A NaN at either end of an
+    # interval makes that interval's distance NaN, so it is excluded below.
     dist_px = np.sqrt(np.diff(x) ** 2 + np.diff(y) ** 2)
+    speed_px_s = dist_px / (1.0 / fps)
 
     out = {
         "frames_tracked_pct": float(100 * np.mean(valid)) if len(valid) else 0.0,
-        "avg_speed_px_frame": _safe_nanmean(dist_px),
-        "max_speed_px_frame": _safe_nanmax(dist_px),
+        "avg_speed_px_s": _safe_nanmean(speed_px_s),
+        "max_speed_px_s": _safe_nanmax(speed_px_s),
         "total_distance_px": float(np.nansum(dist_px)) if len(dist_px) else 0.0,
-        "speed_series_px_frame": [None if np.isnan(v) else round(float(v), 3) for v in dist_px],
+        "speed_series_px_s": [None if np.isnan(v) else round(float(v), 3) for v in speed_px_s],
     }
     if px_per_mm:
-        out["avg_speed_mm_frame"] = out["avg_speed_px_frame"] / px_per_mm if out["avg_speed_px_frame"] is not None else None
-        out["max_speed_mm_frame"] = out["max_speed_px_frame"] / px_per_mm if out["max_speed_px_frame"] is not None else None
+        out["avg_speed_mm_s"] = out["avg_speed_px_s"] / px_per_mm if out["avg_speed_px_s"] is not None else None
+        out["max_speed_mm_s"] = out["max_speed_px_s"] / px_per_mm if out["max_speed_px_s"] is not None else None
         out["total_distance_mm"] = out["total_distance_px"] / px_per_mm
     return out
 

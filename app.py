@@ -413,6 +413,14 @@ def _candidate_center(candidate: dict):
     return float(np.mean(xs)), float(np.mean(ys))
 
 
+def _center_with_conf(candidate: dict):
+    """(x, y, detection_confidence) of the detection center, or None."""
+    center = _candidate_center(candidate)
+    if center is None:
+        return None
+    return (center[0], center[1], _safe_float(candidate.get("confidence"), 0.0))
+
+
 def _candidate_box(candidate: dict):
     """(x1, y1, x2, y2) box for a candidate; falls back to its keypoint extent."""
     x, y = candidate.get("x"), candidate.get("y")
@@ -668,8 +676,10 @@ def _assign_candidates_to_tracks(tracks: list[dict], candidates: list[dict]) -> 
         candidate = assigned.get(track_i)
         if candidate is None:
             track["frames"].append(None)
+            track["centers"].append(None)
             continue
         track["frames"].append(candidate["keypoints"])
+        track["centers"].append(_center_with_conf(candidate))
         track["last_center"] = _candidate_center(candidate)
 
 
@@ -698,6 +708,7 @@ def _select_same_worm_tracks(frames_candidates: list[list[dict]], max_tracks: in
             "seed_confidence": _safe_float(seed.get("confidence"), 0.0),
             "last_center": _candidate_center(seed),
             "frames": [None for _ in range(seed_frame)] + [seed["keypoints"]],
+            "centers": [None for _ in range(seed_frame)] + [_center_with_conf(seed)],
         })
 
     for candidates in frames_candidates[seed_frame + 1:]:
@@ -1057,24 +1068,28 @@ def _analyze_worm_track(
             "net_displacement_px": _round_or_none(kd["net_displacement_px"]),
         })
 
-    # Track the TAIL and report its average per-frame movement. Of the worm's
-    # two endpoints the tail is the one that travels farthest from its start
-    # (overridable via ROBOFLOW_TAIL_KEYPOINT / WORM_ENDPOINT_INDEX). A frame
-    # where that keypoint is missing is a NaN gap, never a fake 0 or a fake jump.
-    tail_idx = _choose_endpoint(per_endpoint)
-    xs, ys, confs = tracks[tail_idx]
-    tail_name = per_endpoint[tail_idx]["name"]
+    # Track the worm's CENTER — the detection center, which is the midpoint of
+    # the two endpoints when both fire and stays on the body when only one does.
+    # It doesn't lurch on keypoint dropouts, so speed reflects real body motion.
+    # A frame where the worm wasn't detected/matched is still a NaN gap.
+    xs, ys, confs = [], [], []
+    for c in (track.get("centers") or []):
+        if c is None:
+            xs.append(np.nan); ys.append(np.nan); confs.append(0.0)
+        else:
+            xs.append(c[0]); ys.append(c[1]); confs.append(c[2])
 
-    metrics = compute_track_speed(xs, ys, confs, pcutoff=pcutoff, px_per_mm=px_per_mm)
+    metrics = compute_track_speed(xs, ys, confs, fps=effective_fps, pcutoff=pcutoff, px_per_mm=px_per_mm)
     disp = compute_displacement(xs, ys, confs, pcutoff=pcutoff, px_per_mm=px_per_mm)
 
-    # frame_series is the x-axis for the chart: speed[i] is the px/frame moved
-    # between analyzed frame i and i+1, labeled by the later frame (1-based).
-    n_speeds = len(metrics["speed_series_px_frame"])
-    frame_series = [i + 1 for i in range(n_speeds)]
+    # time_series_s is the x-axis for the chart: speed[i] covers the interval
+    # between analyzed frame i and i+1, labeled by the time of the later frame.
+    n_speeds = len(metrics["speed_series_px_s"])
+    time_series_s = [round((i + 1) / effective_fps, 3) for i in range(n_speeds)]
 
-    # Which analyzed frame the worm was farthest from its start, for the marker.
+    # When the farthest-reach happened (seconds from start), for the chart marker.
     far_frame = disp.get("farthest_displacement_frame")
+    far_time = round(far_frame / effective_fps, 3) if far_frame is not None else None
     seed_frame = int(track.get("seed_frame", 0))
 
     return {
@@ -1090,19 +1105,19 @@ def _analyze_worm_track(
         "effective_fps": round(float(effective_fps), 3),
         "frames_analyzed": frames_analyzed,
         "frames_tracked_pct": round(metrics["frames_tracked_pct"], 3),
-        "avg_speed_px_frame": _round_or_none(metrics["avg_speed_px_frame"]),
-        "max_speed_px_frame": _round_or_none(metrics["max_speed_px_frame"]),
+        "avg_speed_px_s": _round_or_none(metrics["avg_speed_px_s"]),
+        "max_speed_px_s": _round_or_none(metrics["max_speed_px_s"]),
         "total_distance_px": round(metrics["total_distance_px"], 3),
         "farthest_displacement_px": _round_or_none(disp["farthest_displacement_px"]),
         "net_displacement_px": _round_or_none(disp["net_displacement_px"]),
-        "farthest_displacement_frame": far_frame,
-        "tracked_point": "tail",
-        "tracked_endpoint_name": tail_name,
+        "farthest_displacement_time_s": far_time,
+        "tracked_point": "center",
+        "tracked_endpoint_name": "center (worm body center)",
         "endpoints": per_endpoint,
-        "speed_series_px_frame": metrics["speed_series_px_frame"],
-        "frame_series": frame_series,
-        "avg_speed_mm_frame": _round_or_none(metrics.get("avg_speed_mm_frame")),
-        "max_speed_mm_frame": _round_or_none(metrics.get("max_speed_mm_frame")),
+        "speed_series_px_s": metrics["speed_series_px_s"],
+        "time_series_s": time_series_s,
+        "avg_speed_mm_s": _round_or_none(metrics.get("avg_speed_mm_s")),
+        "max_speed_mm_s": _round_or_none(metrics.get("max_speed_mm_s")),
         "total_distance_mm": _round_or_none(metrics.get("total_distance_mm")),
         "farthest_displacement_mm": _round_or_none(disp.get("farthest_displacement_mm")),
         "net_displacement_mm": _round_or_none(disp.get("net_displacement_mm")),
@@ -1263,15 +1278,15 @@ CSV_BASE_COLUMNS = [
     "native_fps",
     "frames_analyzed",
     "frames_tracked_pct",
-    "avg_speed_px_frame",
-    "max_speed_px_frame",
+    "avg_speed_px_s",
+    "max_speed_px_s",
     "total_distance_px",
     "farthest_displacement_px",
     "net_displacement_px",
 ]
 CSV_MM_COLUMNS = [
-    "avg_speed_mm_frame",
-    "max_speed_mm_frame",
+    "avg_speed_mm_s",
+    "max_speed_mm_s",
     "total_distance_mm",
     "farthest_displacement_mm",
     "net_displacement_mm",
@@ -1285,7 +1300,7 @@ def _batch_summary(results: list[dict], used_mm: bool) -> dict:
       - how far the farthest tracked center moved, and which video that was.
     Failed videos and videos with no trackable speed are excluded from means.
     """
-    speed_key = "avg_speed_mm_frame" if used_mm else "avg_speed_px_frame"
+    speed_key = "avg_speed_mm_s" if used_mm else "avg_speed_px_s"
     far_key = "farthest_displacement_mm" if used_mm else "farthest_displacement_px"
     ok = [r for r in results if "error" not in r]
 
@@ -1302,7 +1317,7 @@ def _batch_summary(results: list[dict], used_mm: bool) -> dict:
         "videos_total": len(results),
         "videos_ok": len(ok),
         "videos_failed": len(results) - len(ok),
-        "units_speed": "mm/frame" if used_mm else "px/frame",
+        "units_speed": "mm/s" if used_mm else "px/s",
         "units_distance": "mm" if used_mm else "px",
         "avg_speed": avg_speed,
         "farthest_displacement": round(far_value, 3) if far_value is not None else None,
