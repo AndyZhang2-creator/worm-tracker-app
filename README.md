@@ -77,13 +77,10 @@ Notes:
   so each reported row follows the same worm identity. Distant unmatched
   detections become gaps instead of replacing one of the seeded worms.
 - **Endpoints, not head/tail.** This model emits two keypoints named
-  `End-point1` (id 0) and `End-Point-2` (id 1), not head/tail. The two ends of a
-  worm move differently, so after choosing each seeded worm, the app tracks
-  **both** endpoints on that worm and reports
-  whichever moved farthest from its start ("the farthest tail"); each video's
-  response includes an `endpoints` breakdown with both. Pin a specific end with
-  `WORM_ENDPOINT_INDEX=0|1` or `ROBOFLOW_TAIL_KEYPOINT=<name>`.
-  `probe_roboflow.py` dumps the raw response if you want to re-confirm the schema.
+  `End-point1` (id 0) and `End-Point-2` (id 1), not head/tail. The app reports
+  each endpoint's displacement for reference, then tracks the worm center
+  midpoint for speed and headline displacement. `probe_roboflow.py` dumps the
+  raw response if you want to re-confirm the schema.
 - One HTTP round-trip per sampled frame, so hosted workflow inference is slower
   than local weights.
 
@@ -132,42 +129,32 @@ Then open <http://localhost:8000>.
    worm does not get renamed just because confidence order changes. When the run
    finishes, a summary banner shows the headline numbers, results appear in a
    table, and clicking any row shows the labeled tracking frame for that worm,
-   draws that video's speed-over-time chart, shows a one-second average-speed
-   table, and adds an amber marker at the moment the tail was farthest from
-   start.
-4. After a batch run, **Download CSV** exports one row per worm/video, including
-   per-second average speed columns.
+   draws that video's speed-over-time chart, and adds an amber marker at the
+   moment the worm center was farthest from start.
+4. After a batch run, **Download CSV** exports one row per worm/video.
 
 ### Metrics reported
 
 Per tracked worm (and as CSV columns):
 
-- **avg / max speed** — the average and peak tail speed (px/s, or mm/s if
-  calibrated). The average is the headline "how fast the worm is moving".
+- **avg / max speed** — the average and peak center speed (px/frame, or
+  mm/frame if calibrated). The average is the headline "how fast the worm is
+  moving" in sampled-frame units.
 - **worm_id** — identity number seeded by confidence, up to five per video.
-- **per-second speed** (`per_second_speed`) — one-second bins for each tracked
-  worm, each with `avg_speed_px_s` and the amount of tracked time in that
-  second. The CSV exports these as columns such as
-  `second_0_1_avg_speed_px_s`, `second_1_2_avg_speed_px_s`, etc.; calibrated
-  runs also include matching `*_mm_s` columns.
 - **tracking frame** (`tracking_frame_image`) - a JPEG data URL of the seed
   frame with the tracked worms labeled. The selected row's worm is highlighted
   in the browser so the picture and the speed numbers refer to the same seeded
   identity.
-- **farthest tail** (`farthest_displacement`) — the maximum straight-line
-  distance the tracked endpoint ever reached from its **first tracked
-  position**: how far that end of the worm got from where it started. By default
-  the tracked endpoint is whichever of the worm's two ends moved farthest (see
-  "Endpoints, not head/tail" above); `tracked_endpoint_name` and the `endpoints`
-  breakdown report which one and both ends' numbers.
+- **farthest center** (`farthest_displacement`) — the maximum straight-line
+  distance the tracked center ever reached from its **first tracked position**.
 - **endpoint** (`net_displacement`) — straight-line distance from the first to
-  the last tracked tail position (start → endpoint), regardless of path.
-- **distance** (`total_distance`) — total path length the tail travelled.
+  the last tracked center position (start -> endpoint), regardless of path.
+- **distance** (`total_distance`) — total path length the center travelled.
 
 Batch summary banner:
 
 - **average worm speed** — mean of the per-video average speeds.
-- **farthest tail moved** — the largest `farthest_displacement` across the
+- **farthest center moved** — the largest `farthest_displacement` across the
   batch, and which video it came from.
 
 All displacement metrics use the same NaN-gap rule as speed: low-confidence

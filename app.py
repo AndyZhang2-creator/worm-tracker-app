@@ -356,6 +356,47 @@ def _safe_float(value, default=0.0) -> float:
         return default
 
 
+def _find_response_image_size(obj):
+    """
+    Find Roboflow response image dimensions without confusing detection box
+    widths/heights for the whole image size.
+    """
+    if isinstance(obj, list):
+        for item in obj:
+            found = _find_response_image_size(item)
+            if found:
+                return found
+    elif isinstance(obj, dict):
+        image = obj.get("image")
+        if isinstance(image, dict):
+            w = _safe_float(image.get("width"), 0.0)
+            h = _safe_float(image.get("height"), 0.0)
+            if w > 0 and h > 0:
+                return w, h
+        for value in obj.values():
+            found = _find_response_image_size(value)
+            if found:
+                return found
+    return None
+
+
+def _coordinate_scale_for_response(data, frame_shape):
+    if frame_shape is None:
+        return 1.0, 1.0
+    response_size = _find_response_image_size(data)
+    if not response_size:
+        return 1.0, 1.0
+    response_w, response_h = response_size
+    frame_h, frame_w = frame_shape[:2]
+    if response_w <= 0 or response_h <= 0 or frame_w <= 0 or frame_h <= 0:
+        return 1.0, 1.0
+    return float(frame_w) / response_w, float(frame_h) / response_h
+
+
+def _scale_optional(value, scale):
+    return None if value is None else float(value) * scale
+
+
 def _candidate_center(candidate: dict):
     x = candidate.get("x")
     y = candidate.get("y")
@@ -426,7 +467,7 @@ def _dedupe_overlapping(candidates: list[dict], tolerance: float):
     return kept
 
 
-def _parse_roboflow_detections(data):
+def _parse_roboflow_detections(data, frame_shape=None):
     """
     Return every worm detection at or above RF_CONFIDENCE, sorted by confidence.
     Each candidate carries the full keypoint list so a later pass can associate
@@ -436,6 +477,7 @@ def _parse_roboflow_detections(data):
     if not preds:
         return []
 
+    scale_x, scale_y = _coordinate_scale_for_response(data, frame_shape)
     detections = []
     for pred in preds:
         det_conf = _safe_float(pred.get("confidence"), 0.0)
@@ -448,15 +490,15 @@ def _parse_roboflow_detections(data):
                 continue
             name = str(kp.get("class_name", kp.get("class", ""))).strip()
             conf = _safe_float(kp.get("confidence"), det_conf)
-            kps.append((float(kp["x"]), float(kp["y"]), conf, name))
+            kps.append((float(kp["x"]) * scale_x, float(kp["y"]) * scale_y, conf, name))
         if not kps:
             continue
 
         candidate = {
-            "x": pred.get("x"),
-            "y": pred.get("y"),
-            "width": pred.get("width"),
-            "height": pred.get("height"),
+            "x": _scale_optional(pred.get("x"), scale_x),
+            "y": _scale_optional(pred.get("y"), scale_y),
+            "width": _scale_optional(pred.get("width"), scale_x),
+            "height": _scale_optional(pred.get("height"), scale_y),
             "confidence": det_conf,
             "class": pred.get("class_name", pred.get("class", "")),
             "keypoints": kps,
@@ -467,12 +509,12 @@ def _parse_roboflow_detections(data):
     return sorted(detections, key=lambda c: c["confidence"], reverse=True)
 
 
-def _parse_roboflow_keypoints(data):
+def _parse_roboflow_keypoints(data, frame_shape=None):
     """
     Backwards-compatible helper: return keypoints for the highest-confidence
     detection after applying the Roboflow confidence floor.
     """
-    detections = _parse_roboflow_detections(data)
+    detections = _parse_roboflow_detections(data, frame_shape=frame_shape)
     return detections[0]["keypoints"] if detections else None
 
 
@@ -498,7 +540,7 @@ def make_detector(overlap_tolerance: float = DEFAULT_OVERLAP_TOLERANCE):
 
         def detect(frame):
             return _dedupe_overlapping(
-                _parse_roboflow_detections(_roboflow_infer(frame)), overlap_tolerance
+                _parse_roboflow_detections(_roboflow_infer(frame), frame_shape=frame.shape), overlap_tolerance
             )
 
         return detect
@@ -973,62 +1015,6 @@ def _tracking_frame_payloads(path: str, tracks: list[dict], native_fps: float, s
     return payloads
 
 
-def _per_second_speed_bins(speed_series_px_s: list, effective_fps: float, px_per_mm):
-    """
-    Average the selected worm's speed into one-second buckets. Each speed sample
-    represents the interval between two analyzed frames, so intervals are
-    duration-weighted when they straddle a second boundary.
-    """
-    if not speed_series_px_s or effective_fps <= 0:
-        return []
-
-    dt = 1.0 / effective_fps
-    total_duration = len(speed_series_px_s) * dt
-    n_bins = int(np.ceil(total_duration))
-    weighted_sums = [0.0 for _ in range(n_bins)]
-    valid_durations = [0.0 for _ in range(n_bins)]
-
-    for i, speed in enumerate(speed_series_px_s):
-        if speed is None:
-            continue
-        value = _safe_float(speed, np.nan)
-        if np.isnan(value):
-            continue
-
-        interval_start = i * dt
-        interval_end = (i + 1) * dt
-        first_bin = int(np.floor(interval_start))
-        last_bin = int(np.ceil(interval_end))
-        for bin_i in range(first_bin, min(last_bin, n_bins)):
-            overlap = min(interval_end, bin_i + 1.0) - max(interval_start, float(bin_i))
-            if overlap <= 0:
-                continue
-            weighted_sums[bin_i] += value * overlap
-            valid_durations[bin_i] += overlap
-
-    bins = []
-    for second in range(n_bins):
-        avg_px = (
-            weighted_sums[second] / valid_durations[second]
-            if valid_durations[second] > 0
-            else None
-        )
-        bucket = {
-            "second": second,
-            "start_s": round(float(second), 3),
-            "end_s": round(float(min(second + 1.0, total_duration)), 3),
-            "avg_speed_px_s": _round_or_none(avg_px),
-            "tracked_duration_s": round(float(valid_durations[second]), 3),
-        }
-        if px_per_mm:
-            bucket["avg_speed_mm_s"] = (
-                _round_or_none(avg_px / px_per_mm) if avg_px is not None else None
-            )
-        bins.append(bucket)
-
-    return bins
-
-
 def _analyze_worm_track(
     path: str,
     track: dict,
@@ -1082,28 +1068,23 @@ def _analyze_worm_track(
             xs.append((pts[0][0] + pts[1][0]) / 2.0)
             ys.append((pts[0][1] + pts[1][1]) / 2.0)
             confs.append(min(pts[0][2], pts[1][2]))
-        elif len(pts) == 1:
-            xs.append(pts[0][0]); ys.append(pts[0][1]); confs.append(pts[0][2])
         else:
+            # The center is the MIDPOINT of the two endpoints. With fewer than
+            # two we can't place it, so this is a NaN gap — using a lone endpoint
+            # would sit ~half a body-length off the true midpoint and inject a
+            # fake jump in and out of the frame, inflating per-frame speed.
             xs.append(np.nan); ys.append(np.nan); confs.append(0.0)
 
-    metrics = compute_track_speed(
-        xs, ys, confs, fps=effective_fps, pcutoff=pcutoff, px_per_mm=px_per_mm
-    )
+    metrics = compute_track_speed(xs, ys, confs, pcutoff=pcutoff, px_per_mm=px_per_mm)
     disp = compute_displacement(xs, ys, confs, pcutoff=pcutoff, px_per_mm=px_per_mm)
-    per_second_speed = _per_second_speed_bins(
-        metrics["speed_series_px_s"], effective_fps=effective_fps, px_per_mm=px_per_mm
-    )
 
-    # time_series_s is one timestamp per speed value (i.e. per interval).
-    # speed[i] covers the interval between analyzed frame i and i+1; we label it
-    # by the time of the later frame.
-    n_speeds = len(metrics["speed_series_px_s"])
-    time_series_s = [round((i + 1) / effective_fps, 3) for i in range(n_speeds)]
+    # frame_series is the x-axis for the chart: speed[i] is the px/frame moved
+    # between analyzed frame i and i+1, labeled by the later frame (1-based).
+    n_speeds = len(metrics["speed_series_px_frame"])
+    frame_series = [i + 1 for i in range(n_speeds)]
 
-    # When the farthest-reach happened (seconds from start), for the chart.
+    # Which analyzed frame the worm was farthest from its start, for the marker.
     far_frame = disp.get("farthest_displacement_frame")
-    far_time = round(far_frame / effective_fps, 3) if far_frame is not None else None
     seed_frame = int(track.get("seed_frame", 0))
 
     return {
@@ -1119,20 +1100,19 @@ def _analyze_worm_track(
         "effective_fps": round(float(effective_fps), 3),
         "frames_analyzed": frames_analyzed,
         "frames_tracked_pct": round(metrics["frames_tracked_pct"], 3),
-        "avg_speed_px_s": _round_or_none(metrics["avg_speed_px_s"]),
-        "max_speed_px_s": _round_or_none(metrics["max_speed_px_s"]),
+        "avg_speed_px_frame": _round_or_none(metrics["avg_speed_px_frame"]),
+        "max_speed_px_frame": _round_or_none(metrics["max_speed_px_frame"]),
         "total_distance_px": round(metrics["total_distance_px"], 3),
         "farthest_displacement_px": _round_or_none(disp["farthest_displacement_px"]),
         "net_displacement_px": _round_or_none(disp["net_displacement_px"]),
-        "farthest_displacement_time_s": far_time,
+        "farthest_displacement_frame": far_frame,
         "tracked_point": "center",
         "tracked_endpoint_name": "center (midpoint of endpoints)",
         "endpoints": per_endpoint,
-        "speed_series_px_s": metrics["speed_series_px_s"],
-        "per_second_speed": per_second_speed,
-        "time_series_s": time_series_s,
-        "avg_speed_mm_s": _round_or_none(metrics.get("avg_speed_mm_s")),
-        "max_speed_mm_s": _round_or_none(metrics.get("max_speed_mm_s")),
+        "speed_series_px_frame": metrics["speed_series_px_frame"],
+        "frame_series": frame_series,
+        "avg_speed_mm_frame": _round_or_none(metrics.get("avg_speed_mm_frame")),
+        "max_speed_mm_frame": _round_or_none(metrics.get("max_speed_mm_frame")),
         "total_distance_mm": _round_or_none(metrics.get("total_distance_mm")),
         "farthest_displacement_mm": _round_or_none(disp.get("farthest_displacement_mm")),
         "net_displacement_mm": _round_or_none(disp.get("net_displacement_mm")),
@@ -1156,8 +1136,10 @@ def analyze_video_file(path: str, sample_fps: float, pcutoff: float, px_per_mm, 
     native_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     if native_fps <= 0:
         native_fps = 30.0
+    if sample_fps <= 0:
+        raise ValueError("sample_fps must be greater than 0.")
     step = max(1, round(native_fps / sample_fps))
-    effective_fps = native_fps / step  # <- THIS goes into compute_track_speed
+    effective_fps = native_fps / step
     total_frames_raw = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     frames_to_analyze = int(np.ceil(total_frames_raw / step)) if total_frames_raw > 0 else None
     if progress_callback:
@@ -1245,7 +1227,7 @@ def analyze_video_file(path: str, sample_fps: float, pcutoff: float, px_per_mm, 
 def _choose_endpoint(per_endpoint: list[dict]) -> int:
     """
     Pick which endpoint index to report. Default: the one that moved the
-    farthest from its start (greatest displacement) — "the farthest tail".
+    farthest from its start (greatest displacement).
     Overridable: a forced class name (ROBOFLOW_TAIL_KEYPOINT) or index
     (WORM_ENDPOINT_INDEX) pins a specific endpoint instead.
     """
@@ -1291,15 +1273,15 @@ CSV_BASE_COLUMNS = [
     "native_fps",
     "frames_analyzed",
     "frames_tracked_pct",
-    "avg_speed_px_s",
-    "max_speed_px_s",
+    "avg_speed_px_frame",
+    "max_speed_px_frame",
     "total_distance_px",
     "farthest_displacement_px",
     "net_displacement_px",
 ]
 CSV_MM_COLUMNS = [
-    "avg_speed_mm_s",
-    "max_speed_mm_s",
+    "avg_speed_mm_frame",
+    "max_speed_mm_frame",
     "total_distance_mm",
     "farthest_displacement_mm",
     "net_displacement_mm",
@@ -1310,10 +1292,10 @@ def _batch_summary(results: list[dict], used_mm: bool) -> dict:
     """
     Aggregate the headline numbers the user asked for across a batch:
       - average speed the worms are moving (mean of per-video averages)
-      - how far the farthest tail moved, and which video that was.
+      - how far the farthest tracked center moved, and which video that was.
     Failed videos and videos with no trackable speed are excluded from means.
     """
-    speed_key = "avg_speed_mm_s" if used_mm else "avg_speed_px_s"
+    speed_key = "avg_speed_mm_frame" if used_mm else "avg_speed_px_frame"
     far_key = "farthest_displacement_mm" if used_mm else "farthest_displacement_px"
     ok = [r for r in results if "error" not in r]
 
@@ -1330,7 +1312,7 @@ def _batch_summary(results: list[dict], used_mm: bool) -> dict:
         "videos_total": len(results),
         "videos_ok": len(ok),
         "videos_failed": len(results) - len(ok),
-        "units_speed": "mm/s" if used_mm else "px/s",
+        "units_speed": "mm/frame" if used_mm else "px/frame",
         "units_distance": "mm" if used_mm else "px",
         "avg_speed": avg_speed,
         "farthest_displacement": round(far_value, 3) if far_value is not None else None,
@@ -1339,23 +1321,8 @@ def _batch_summary(results: list[dict], used_mm: bool) -> dict:
     }
 
 
-def _per_second_csv_columns(results: list[dict], used_calibration: bool):
-    max_bins = max((len(r.get("per_second_speed", [])) for r in results if "error" not in r), default=0)
-    columns = []
-    for second in range(max_bins):
-        columns.append((f"second_{second}_{second + 1}_avg_speed_px_s", second, "avg_speed_px_s"))
-        if used_calibration:
-            columns.append((f"second_{second}_{second + 1}_avg_speed_mm_s", second, "avg_speed_mm_s"))
-    return columns
-
-
 def _build_csv(results: list[dict], used_calibration: bool) -> str:
-    second_columns = _per_second_csv_columns(results, used_calibration)
-    base_columns = CSV_BASE_COLUMNS + (CSV_MM_COLUMNS if used_calibration else [])
-    columns = (
-        base_columns
-        + [name for name, _, _ in second_columns]
-    )
+    columns = CSV_BASE_COLUMNS + (CSV_MM_COLUMNS if used_calibration else [])
     buf = io.StringIO()
     writer = csv.writer(buf)
     writer.writerow(columns)
@@ -1365,11 +1332,7 @@ def _build_csv(results: list[dict], used_calibration: bool) -> str:
             # CSV stays a clean rectangle that lines up with the header.
             row = [r.get("video", "")] + ["" for _ in columns[1:]]
         else:
-            row = [r.get(col, "") for col in base_columns]
-            per_second = r.get("per_second_speed", [])
-            for _, second, key in second_columns:
-                value = per_second[second].get(key) if second < len(per_second) else ""
-                row.append("" if value is None else value)
+            row = [r.get(col, "") for col in columns]
         writer.writerow(row)
     return buf.getvalue()
 

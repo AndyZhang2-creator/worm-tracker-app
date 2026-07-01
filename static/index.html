@@ -139,8 +139,6 @@
   #chartTitle { font-size: 14px; font-weight: 600; margin: 0 0 4px; }
   #chartMeta { font-size: 12px; color: var(--muted); margin: 0 0 14px; font-family: var(--mono); }
   canvas { width: 100%; display: block; background: #101316; border: 1px solid var(--border); border-radius: 8px; }
-  #secondBins { margin-top: 14px; overflow-x: auto; }
-  #secondBins table { font-size: 12px; }
   .detail-grid { display: grid; grid-template-columns: minmax(260px, 0.9fr) minmax(420px, 1.4fr); gap: 20px; align-items: start; }
   #trackingFrameTitle { font-size: 14px; font-weight: 600; margin: 0 0 4px; }
   #trackingFrameMeta { font-size: 12px; color: var(--muted); margin: 0 0 14px; font-family: var(--mono); }
@@ -173,7 +171,7 @@
 <header>
   <div>
     <h1>Worm Tail Tracker</h1>
-    <p class="subtitle">Pose-tracked tail velocity for <em>C. elegans</em> clips.</p>
+    <p class="subtitle">Pose-tracked worm movement for <em>C. elegans</em> clips.</p>
   </div>
   <div class="pill" id="modelPill">
     <span class="dot" id="modelDot"></span>
@@ -239,7 +237,7 @@
   <div class="stats">
     <div class="stat"><div class="stat-label">worms analyzed</div><div class="stat-val" id="sCount">—</div></div>
     <div class="stat"><div class="stat-label">average worm speed</div><div class="stat-val" id="sAvg">—</div></div>
-    <div class="stat"><div class="stat-label">farthest tail moved</div><div class="stat-val" id="sFar">—</div></div>
+    <div class="stat"><div class="stat-label">farthest center moved</div><div class="stat-val" id="sFar">—</div></div>
   </div>
   <div class="stat-note" id="sNote"></div>
 </div>
@@ -252,9 +250,9 @@
         <th>Video</th>
         <th class="num">Worm</th>
         <th class="num">% tracked</th>
-        <th class="num" id="hAvg">avg (px/s)</th>
-        <th class="num" id="hMax">max (px/s)</th>
-        <th class="num" id="hFar">farthest tail (px)</th>
+        <th class="num" id="hAvg">avg (px/frame)</th>
+        <th class="num" id="hMax">max (px/frame)</th>
+        <th class="num" id="hFar">farthest center (px)</th>
         <th class="num" id="hNet">endpoint (px)</th>
         <th class="num" id="hDist">distance (px)</th>
       </tr>
@@ -275,7 +273,6 @@
       <p id="chartTitle"></p>
       <p id="chartMeta"></p>
       <canvas id="chart" width="900" height="320"></canvas>
-      <div id="secondBins"></div>
     </div>
   </div>
 </div>
@@ -422,7 +419,7 @@
   });
 
   // ---- Results table ------------------------------------------------------ //
-  function unitSpeed() { return usesMm ? "mm/s" : "px/s"; }
+  function unitSpeed() { return usesMm ? "mm/frame" : "px/frame"; }
   function unitDist() { return usesMm ? "mm" : "px"; }
   function fmt(v) { return (v === null || v === undefined) ? "—" : Number(v).toFixed(2); }
 
@@ -534,7 +531,7 @@
 
     $("hAvg").textContent = "avg (" + unitSpeed() + ")";
     $("hMax").textContent = "max (" + unitSpeed() + ")";
-    $("hFar").textContent = "farthest tail (" + unitDist() + ")";
+    $("hFar").textContent = "farthest center (" + unitDist() + ")";
     $("hNet").textContent = "endpoint (" + unitDist() + ")";
     $("hDist").textContent = "distance (" + unitDist() + ")";
 
@@ -547,8 +544,8 @@
           "<td>" + escapeHtml(r.video || "unknown") + "</td>" +
           '<td class="num" colspan="7">error: ' + escapeHtml(r.error) + "</td>";
       } else {
-        const avg = usesMm ? r.avg_speed_mm_s : r.avg_speed_px_s;
-        const max = usesMm ? r.max_speed_mm_s : r.max_speed_px_s;
+        const avg = usesMm ? r.avg_speed_mm_frame : r.avg_speed_px_frame;
+        const max = usesMm ? r.max_speed_mm_frame : r.max_speed_px_frame;
         const dist = usesMm ? r.total_distance_mm : r.total_distance_px;
         const far = usesMm ? r.farthest_displacement_mm : r.farthest_displacement_px;
         const net = usesMm ? r.net_displacement_mm : r.net_displacement_px;
@@ -578,7 +575,7 @@
     $("sFar").textContent = (s.farthest_displacement === null ? "—" : Number(s.farthest_displacement).toFixed(2)) + " " + s.units_distance;
     let note = "";
     if (s.farthest_displacement_video) {
-      note += "farthest tail reached in " + s.farthest_displacement_video;
+      note += "farthest center reached in " + s.farthest_displacement_video;
       if (s.farthest_displacement_worm_id) note += " worm " + s.farthest_displacement_worm_id;
     }
     if (s.videos_failed) note += (note ? " · " : "") + s.videos_failed + " video(s) failed";
@@ -589,31 +586,6 @@
     document.querySelectorAll("#resultsBody tr").forEach((row) => row.classList.remove("selected"));
     tr.classList.add("selected");
     drawChart(lastResults[idx]);
-  }
-
-  function renderSecondBins(r) {
-    const bins = r.per_second_speed || [];
-    const wrap = $("secondBins");
-    if (!bins.length) {
-      wrap.innerHTML = "";
-      return;
-    }
-
-    const rows = bins.map((bin) => {
-      const avg = usesMm ? bin.avg_speed_mm_s : bin.avg_speed_px_s;
-      return "<tr>" +
-        '<td class="num">' + Number(bin.start_s).toFixed(1) + "-" + Number(bin.end_s).toFixed(1) + "s</td>" +
-        '<td class="num">' + fmt(avg) + "</td>" +
-        '<td class="num">' + fmt(bin.tracked_duration_s) + "</td>" +
-      "</tr>";
-    }).join("");
-
-    wrap.innerHTML =
-      "<table><thead><tr>" +
-      '<th class="num">second</th>' +
-      '<th class="num">avg (' + unitSpeed() + ")</th>" +
-      '<th class="num">tracked s</th>' +
-      "</tr></thead><tbody>" + rows + "</tbody></table>";
   }
 
   function renderTrackingFrame(r) {
@@ -637,7 +609,6 @@
   function drawChart(r) {
     chartPanel.style.display = "block";
     renderTrackingFrame(r);
-    renderSecondBins(r);
     $("chartTitle").textContent = r.video + " · worm " + (r.worm_id || "—");
     const far = usesMm ? r.farthest_displacement_mm : r.farthest_displacement_px;
     const epName = r.tracked_endpoint_name || "center";
@@ -645,12 +616,12 @@
       "native " + fmt(r.native_fps) + " fps · effective " + fmt(r.effective_fps) +
       " fps · " + r.frames_analyzed + " frames · " + fmt(r.frames_tracked_pct) + "% tracked · " +
       "tracking " + epName + " · farthest " + fmt(far) + " " + unitDist() +
-      (r.farthest_displacement_time_s != null ? " @ " + fmt(r.farthest_displacement_time_s) + "s" : "");
+      (r.farthest_displacement_frame != null ? " @ frame " + r.farthest_displacement_frame : "");
 
     const speeds = usesMm
-      ? scaleSeries(r.speed_series_px_s, r.avg_speed_px_s, r.avg_speed_mm_s)
-      : r.speed_series_px_s;
-    const times = r.time_series_s || speeds.map((_, i) => i);
+      ? scaleSeries(r.speed_series_px_frame, r.avg_speed_px_frame, r.avg_speed_mm_frame)
+      : r.speed_series_px_frame;
+    const times = r.frame_series || speeds.map((_, i) => i + 1);
 
     const canvas = $("chart");
     const ctx = canvas.getContext("2d");
@@ -694,13 +665,13 @@
     for (let i = 0; i <= xTicks; i++) {
       const t = (maxTime / xTicks) * i;
       const x = xOf(t);
-      ctx.fillText(t.toFixed(1) + "s", x, cssH - padB + 8);
+      ctx.fillText(Math.round(t), x, cssH - padB + 8);
     }
 
     // Axis labels.
     ctx.fillStyle = "#8a9098";
     ctx.textAlign = "center";
-    ctx.fillText("time (s)", padL + plotW / 2, cssH - 12);
+    ctx.fillText("frame", padL + plotW / 2, cssH - 12);
     ctx.save();
     ctx.translate(14, padT + plotH / 2);
     ctx.rotate(-Math.PI / 2);
@@ -734,9 +705,9 @@
       }
     });
 
-    // Vertical amber marker at the moment the tail was farthest from its start.
-    if (r.farthest_displacement_time_s != null && maxTime > 0) {
-      const x = xOf(r.farthest_displacement_time_s);
+    // Vertical amber marker at the frame the worm was farthest from its start.
+    if (r.farthest_displacement_frame != null && maxTime > 0) {
+      const x = xOf(r.farthest_displacement_frame);
       ctx.strokeStyle = "#E8A33D";
       ctx.setLineDash([4, 4]);
       ctx.lineWidth = 1;
@@ -749,8 +720,8 @@
     }
   }
 
-  // When calibrated, convert the px/s series to mm/s using the same ratio the
-  // backend used (avg_mm / avg_px), so the chart axis matches the table.
+  // When calibrated, convert the px/frame series to mm/frame using the same
+  // ratio the backend used (avg_mm / avg_px), so the chart axis matches the table.
   function scaleSeries(series, avgPx, avgMm) {
     if (!avgPx || !avgMm) return series;
     const ratio = avgMm / avgPx;

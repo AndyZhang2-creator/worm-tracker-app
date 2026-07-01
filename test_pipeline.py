@@ -100,31 +100,35 @@ def main():
     r15 = r15_rows[0]
 
     print(f"30fps clip: native={r30['native_fps']} eff={r30['effective_fps']} "
-          f"avg={r30['avg_speed_px_s']} px/s  tracked={r30['frames_tracked_pct']}%")
+          f"avg={r30['avg_speed_px_frame']} px/frame  tracked={r30['frames_tracked_pct']}%")
     print(f"15fps clip: native={r15['native_fps']} eff={r15['effective_fps']} "
-          f"avg={r15['avg_speed_px_s']} px/s  tracked={r15['frames_tracked_pct']}%")
+          f"avg={r15['avg_speed_px_frame']} px/frame  tracked={r15['frames_tracked_pct']}%")
 
-    # Per-video fps must NOT be assumed global. 30fps -> step 3 -> eff 10fps,
-    # blob moves 4px/frame so 12px per sampled interval -> ~120 px/s.
-    # 15fps -> step round(15/10)=2 wait... round(1.5)=2 -> eff 7.5fps,
-    # 8px per sampled interval * 7.5 = 60 px/s. Different effective fps, and
-    # the speeds reflect each clip's own fps rather than one shared value.
+    # Per-video fps must NOT be assumed global. 30fps -> step 3, blob moves
+    # 4px/native-frame so 12px per sampled frame -> 12 px/frame. 15fps ->
+    # step round(15/10)=2, so 8px per sampled frame -> 8 px/frame. Speed is now
+    # pixels PER FRAME (per sampled step), independent of the time between frames.
     assert abs(r30["effective_fps"] - 10.0) < 1e-6
     assert abs(r15["effective_fps"] - 7.5) < 1e-6
-    assert abs(r30["avg_speed_px_s"] - 120.0) < 2.0, r30["avg_speed_px_s"]
-    assert abs(r15["avg_speed_px_s"] - 60.0) < 2.0, r15["avg_speed_px_s"]
-    print("OK: per-video native fps handled correctly (not skewed by a global fps)")
+    assert abs(r30["avg_speed_px_frame"] - 12.0) < 0.5, r30["avg_speed_px_frame"]
+    assert abs(r15["avg_speed_px_frame"] - 8.0) < 0.5, r15["avg_speed_px_frame"]
+    print("OK: per-video sampling handled correctly (px/frame reflects each clip's step)")
+    try:
+        app.analyze_video_file(v30, sample_fps=0.0, pcutoff=0.5, px_per_mm=None)
+        raise AssertionError("sample_fps=0 should fail")
+    except ValueError as exc:
+        assert "sample_fps" in str(exc), exc
+    print("OK: invalid sample_fps rejected before sampling")
 
     # Displacement metrics. The blob moves in a straight horizontal line, so the
     # farthest reach from start == net (start->endpoint) == total path (~156px).
     assert abs(r30["farthest_displacement_px"] - 156.0) < 6.0, r30["farthest_displacement_px"]
     assert abs(r30["net_displacement_px"] - 156.0) < 6.0, r30["net_displacement_px"]
-    assert r30["farthest_displacement_time_s"] is not None
-    assert r30["per_second_speed"][0]["avg_speed_px_s"] == 120.0, r30["per_second_speed"]
-    assert r30["per_second_speed"][1]["avg_speed_px_s"] == 120.0, r30["per_second_speed"]
-    assert r30["per_second_speed"][1]["tracked_duration_s"] == 0.3, r30["per_second_speed"]
-    assert len(r15["per_second_speed"]) == 3, r15["per_second_speed"]
-    assert r15["per_second_speed"][2]["avg_speed_px_s"] == 60.0, r15["per_second_speed"]
+    assert r30["farthest_displacement_frame"] is not None
+    # Constant-motion blob -> every per-frame speed sample equals ~12 px/frame.
+    assert r30["speed_series_px_frame"][0] == 12.0, r30["speed_series_px_frame"]
+    assert r30["frame_series"][0] == 1, r30["frame_series"]
+    assert len(r30["frame_series"]) == len(r30["speed_series_px_frame"])
     assert r30["tracking_frame_image"].startswith("data:image/jpeg;base64,"), r30.keys()
     assert r30["tracking_frame_index"] == 0
     assert r30["tracking_frame_analyzed_index"] == 0
@@ -149,21 +153,21 @@ def main():
     assert frame_event["image"].startswith("data:image/jpeg;base64,"), frame_event.keys()
     assert frame_event["detections"] == 1, frame_event
     assert frame_event["worm_ids"] == [1], frame_event
-    assert streamed_rows[0]["avg_speed_px_s"] == r30["avg_speed_px_s"]
+    assert streamed_rows[0]["avg_speed_px_frame"] == r30["avg_speed_px_frame"]
     print("OK: live progress events include annotated model-detection frames")
     # Both endpoints are reported for reference, but the tracked point is the
     # CENTER (midpoint of the two endpoints), and we measure how far it travels.
     assert len(r30["endpoints"]) == 2, r30["endpoints"]
     assert r30["tracked_point"] == "center", r30.get("tracked_point")
     print(f"OK: center-midpoint displacement — farthest {r30['farthest_displacement_px']}px @ "
-          f"{r30['farthest_displacement_time_s']}s, net {r30['net_displacement_px']}px "
+          f"frame {r30['farthest_displacement_frame']}, net {r30['net_displacement_px']}px "
           f"(tracking {r30['tracked_endpoint_name']})")
 
-    # Calibration switches units.
+    # Calibration switches units. 12 px/frame at 10 px/mm -> 1.2 mm/frame.
     rc = app.analyze_video_file(v30, sample_fps=10.0, pcutoff=0.5, px_per_mm=10.0)[0]
-    assert abs(rc["avg_speed_mm_s"] - 12.0) < 0.3, rc["avg_speed_mm_s"]
+    assert abs(rc["avg_speed_mm_frame"] - 1.2) < 0.05, rc["avg_speed_mm_frame"]
     assert abs(rc["farthest_displacement_mm"] - 15.6) < 0.6, rc["farthest_displacement_mm"]
-    print(f"OK: calibration px_per_mm=10 -> avg {rc['avg_speed_mm_s']} mm/s, "
+    print(f"OK: calibration px_per_mm=10 -> avg {rc['avg_speed_mm_frame']} mm/frame, "
           f"farthest {rc['farthest_displacement_mm']} mm")
 
     # Batch with a corrupt file in the middle: others survive, bad one errors.
@@ -182,12 +186,12 @@ def main():
     # Batch summary — the headline answers the user asked for.
     summary = app._batch_summary(results, used_mm=False)
     assert summary["videos_ok"] == 2 and summary["videos_failed"] == 1
-    # mean of the two per-video averages (~120 and ~60) -> ~90 px/s.
-    assert abs(summary["avg_speed"] - 90.0) < 3.0, summary["avg_speed"]
+    # mean of the two per-video averages (~12 and ~8) -> ~10 px/frame.
+    assert abs(summary["avg_speed"] - 10.0) < 0.5, summary["avg_speed"]
     assert summary["farthest_displacement_video"] in ("clip30fps.mp4", "clip15fps.mp4")
     assert summary["farthest_displacement_worm_id"] == 1
     print(f"OK: batch summary — {summary['videos_ok']} worms, avg "
-          f"{summary['avg_speed']} px/s, farthest {summary['farthest_displacement']}px "
+          f"{summary['avg_speed']} px/frame, farthest {summary['farthest_displacement']}px "
           f"in {summary['farthest_displacement_video']}")
 
     # CSV building (pixels + mm variants), now including displacement columns.
@@ -196,16 +200,16 @@ def main():
     header_px = csv_px.splitlines()[0]
     header_mm = csv_mm.splitlines()[0]
     assert header_px.startswith(",".join(app.CSV_BASE_COLUMNS))
-    assert "farthest_displacement_px" in csv_px.splitlines()[0]
-    assert "second_0_1_avg_speed_px_s" in header_px
-    assert "second_2_3_avg_speed_px_s" in header_px
+    assert "avg_speed_px_frame" in header_px
+    assert "farthest_displacement_px" in header_px
     assert "broken.mp4" in csv_px
-    assert "second_0_1_avg_speed_mm_s" in header_mm
-    print("OK: CSV header + rows correct (px and mm variants, incl. displacement + per-second speeds)")
+    assert "avg_speed_mm_frame" in header_mm
+    print("OK: CSV header + rows correct (px and mm variants, incl. displacement)")
     print("\nCSV preview (pixels):")
     print(csv_px.strip())
 
     # ---- Roboflow workflow parser (offline, mocked response) ---------------- #
+    test_speed_gaps_do_not_bridge()
     test_roboflow_parser()
     test_overlap_dedupe()
 
@@ -224,6 +228,20 @@ def test_overlap_dedupe():
     assert [c["confidence"] for c in kept] == [0.9, 0.7], kept
     assert len(app._dedupe_overlapping([c_hi, c_dup, c_far], 1.0)) == 3  # disabled
     print("OK: overlap dedup — keeps highest-confidence of overlapping boxes, tol=1 off")
+
+
+def test_speed_gaps_do_not_bridge():
+    """A missed frame must break speed intervals instead of creating a jump."""
+    metrics = app.compute_track_speed(
+        xs=[0.0, 5.0, 200.0, 15.0],
+        ys=[0.0, 0.0, 0.0, 0.0],
+        confs=[0.9, 0.9, 0.0, 0.9],
+        pcutoff=0.5,
+    )
+    assert metrics["speed_series_px_frame"] == [5.0, None, None], metrics
+    assert metrics["avg_speed_px_frame"] == 5.0, metrics
+    assert metrics["total_distance_px"] == 5.0, metrics
+    print("OK: speed gaps - missed detections do not bridge into fake jumps")
 
 
 def test_roboflow_parser():
@@ -259,6 +277,28 @@ def test_roboflow_parser():
         (290.0, 200.0, 0.92, "End-point1"),
         (315.0, 205.0, 0.88, "End-Point-2"),
     ], kps
+
+    scaled_resp = {
+        "image": {"width": 160, "height": 120},
+        "predictions": [
+            {
+                "x": 40, "y": 30, "width": 20, "height": 10,
+                "confidence": 0.95, "class": "C Elegan", "class_id": 0,
+                "keypoints": [
+                    {"x": 30, "y": 25, "confidence": 0.90, "class": "End-point1"},
+                    {"x": 50, "y": 35, "confidence": 0.88, "class": "End-Point-2"},
+                ],
+            },
+        ],
+    }
+    scaled = app._parse_roboflow_detections(scaled_resp, frame_shape=(240, 320, 3))[0]
+    assert scaled["x"] == 80.0 and scaled["y"] == 60.0, scaled
+    assert scaled["width"] == 40.0 and scaled["height"] == 20.0, scaled
+    assert scaled["keypoints"] == [
+        (60.0, 50.0, 0.90, "End-point1"),
+        (100.0, 70.0, 0.88, "End-Point-2"),
+    ], scaled["keypoints"]
+    print("OK: Roboflow parser - scales resized response coordinates to video pixels")
 
     # No detections -> None (becomes a tracking gap, never a fake point).
     assert app._parse_roboflow_keypoints({"predictions": []}) is None
