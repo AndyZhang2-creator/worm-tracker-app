@@ -413,14 +413,6 @@ def _candidate_center(candidate: dict):
     return float(np.mean(xs)), float(np.mean(ys))
 
 
-def _center_with_conf(candidate: dict):
-    """(x, y, detection_confidence) of the detection center, or None."""
-    center = _candidate_center(candidate)
-    if center is None:
-        return None
-    return (center[0], center[1], _safe_float(candidate.get("confidence"), 0.0))
-
-
 def _candidate_box(candidate: dict):
     """(x1, y1, x2, y2) box for a candidate; falls back to its keypoint extent."""
     x, y = candidate.get("x"), candidate.get("y")
@@ -676,10 +668,8 @@ def _assign_candidates_to_tracks(tracks: list[dict], candidates: list[dict]) -> 
         candidate = assigned.get(track_i)
         if candidate is None:
             track["frames"].append(None)
-            track["centers"].append(None)
             continue
         track["frames"].append(candidate["keypoints"])
-        track["centers"].append(_center_with_conf(candidate))
         track["last_center"] = _candidate_center(candidate)
 
 
@@ -708,7 +698,6 @@ def _select_same_worm_tracks(frames_candidates: list[list[dict]], max_tracks: in
             "seed_confidence": _safe_float(seed.get("confidence"), 0.0),
             "last_center": _candidate_center(seed),
             "frames": [None for _ in range(seed_frame)] + [seed["keypoints"]],
-            "centers": [None for _ in range(seed_frame)] + [_center_with_conf(seed)],
         })
 
     for candidates in frames_candidates[seed_frame + 1:]:
@@ -1068,20 +1057,13 @@ def _analyze_worm_track(
             "net_displacement_px": _round_or_none(kd["net_displacement_px"]),
         })
 
-    # Track the worm's CENTER — the detection center, which is the midpoint of
-    # the two endpoints when both fire and stays on the body when only one does.
-    # Recomputing a midpoint from whichever keypoints survived each frame made
-    # the point lurch by ~half a body length on endpoint dropouts: counting
-    # those lurches inflated per-frame speed (overshoot), gapping them dropped
-    # the real motion in those frames (undershoot). The detection center doesn't
-    # move with keypoint dropouts, so speed reflects real body translation.
-    # A frame where the worm wasn't detected/matched is still a NaN gap.
-    xs, ys, confs = [], [], []
-    for c in (track.get("centers") or []):
-        if c is None:
-            xs.append(np.nan); ys.append(np.nan); confs.append(0.0)
-        else:
-            xs.append(c[0]); ys.append(c[1]); confs.append(c[2])
+    # Track the TAIL and report its average per-frame movement. Of the worm's
+    # two endpoints the tail is the one that travels farthest from its start
+    # (overridable via ROBOFLOW_TAIL_KEYPOINT / WORM_ENDPOINT_INDEX). A frame
+    # where that keypoint is missing is a NaN gap, never a fake 0 or a fake jump.
+    tail_idx = _choose_endpoint(per_endpoint)
+    xs, ys, confs = tracks[tail_idx]
+    tail_name = per_endpoint[tail_idx]["name"]
 
     metrics = compute_track_speed(xs, ys, confs, pcutoff=pcutoff, px_per_mm=px_per_mm)
     disp = compute_displacement(xs, ys, confs, pcutoff=pcutoff, px_per_mm=px_per_mm)
@@ -1114,8 +1096,8 @@ def _analyze_worm_track(
         "farthest_displacement_px": _round_or_none(disp["farthest_displacement_px"]),
         "net_displacement_px": _round_or_none(disp["net_displacement_px"]),
         "farthest_displacement_frame": far_frame,
-        "tracked_point": "center",
-        "tracked_endpoint_name": "center (worm body center)",
+        "tracked_point": "tail",
+        "tracked_endpoint_name": tail_name,
         "endpoints": per_endpoint,
         "speed_series_px_frame": metrics["speed_series_px_frame"],
         "frame_series": frame_series,

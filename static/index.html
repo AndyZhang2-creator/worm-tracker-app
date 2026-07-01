@@ -236,8 +236,8 @@
 <div class="panel" id="summaryPanel" style="display:none">
   <div class="stats">
     <div class="stat"><div class="stat-label">worms analyzed</div><div class="stat-val" id="sCount">—</div></div>
-    <div class="stat"><div class="stat-label">average worm speed</div><div class="stat-val" id="sAvg">—</div></div>
-    <div class="stat"><div class="stat-label">farthest center moved</div><div class="stat-val" id="sFar">—</div></div>
+    <div class="stat"><div class="stat-label">average tail speed</div><div class="stat-val" id="sAvg">—</div></div>
+    <div class="stat"><div class="stat-label">farthest tail moved</div><div class="stat-val" id="sFar">—</div></div>
   </div>
   <div class="stat-note" id="sNote"></div>
 </div>
@@ -252,7 +252,7 @@
         <th class="num">% tracked</th>
         <th class="num" id="hAvg">avg (px/frame)</th>
         <th class="num" id="hMax">max (px/frame)</th>
-        <th class="num" id="hFar">farthest center (px)</th>
+        <th class="num" id="hFar">farthest tail (px)</th>
         <th class="num" id="hNet">endpoint (px)</th>
         <th class="num" id="hDist">distance (px)</th>
       </tr>
@@ -531,7 +531,7 @@
 
     $("hAvg").textContent = "avg (" + unitSpeed() + ")";
     $("hMax").textContent = "max (" + unitSpeed() + ")";
-    $("hFar").textContent = "farthest center (" + unitDist() + ")";
+    $("hFar").textContent = "farthest tail (" + unitDist() + ")";
     $("hNet").textContent = "endpoint (" + unitDist() + ")";
     $("hDist").textContent = "distance (" + unitDist() + ")";
 
@@ -575,7 +575,7 @@
     $("sFar").textContent = (s.farthest_displacement === null ? "—" : Number(s.farthest_displacement).toFixed(2)) + " " + s.units_distance;
     let note = "";
     if (s.farthest_displacement_video) {
-      note += "farthest center reached in " + s.farthest_displacement_video;
+      note += "farthest tail reached in " + s.farthest_displacement_video;
       if (s.farthest_displacement_worm_id) note += " worm " + s.farthest_displacement_worm_id;
     }
     if (s.videos_failed) note += (note ? " · " : "") + s.videos_failed + " video(s) failed";
@@ -611,7 +611,7 @@
     renderTrackingFrame(r);
     $("chartTitle").textContent = r.video + " · worm " + (r.worm_id || "—");
     const far = usesMm ? r.farthest_displacement_mm : r.farthest_displacement_px;
-    const epName = r.tracked_endpoint_name || "center";
+    const epName = r.tracked_endpoint_name || "tail";
     $("chartMeta").textContent =
       "native " + fmt(r.native_fps) + " fps · effective " + fmt(r.effective_fps) +
       " fps · " + r.frames_analyzed + " frames · " + fmt(r.frames_tracked_pct) + "% tracked · " +

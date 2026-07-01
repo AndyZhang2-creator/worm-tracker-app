@@ -155,11 +155,12 @@ def main():
     assert frame_event["worm_ids"] == [1], frame_event
     assert streamed_rows[0]["avg_speed_px_frame"] == r30["avg_speed_px_frame"]
     print("OK: live progress events include annotated model-detection frames")
-    # Both endpoints are reported for reference, but the tracked point is the
-    # CENTER (midpoint of the two endpoints), and we measure how far it travels.
+    # Both endpoints are reported for reference; the tracked point is the TAIL
+    # (the endpoint that moves farthest from its start), and we measure how far
+    # and how fast it moves per frame.
     assert len(r30["endpoints"]) == 2, r30["endpoints"]
-    assert r30["tracked_point"] == "center", r30.get("tracked_point")
-    print(f"OK: center-midpoint displacement — farthest {r30['farthest_displacement_px']}px @ "
+    assert r30["tracked_point"] == "tail", r30.get("tracked_point")
+    print(f"OK: tail movement — farthest {r30['farthest_displacement_px']}px @ "
           f"frame {r30['farthest_displacement_frame']}, net {r30['net_displacement_px']}px "
           f"(tracking {r30['tracked_endpoint_name']})")
 
