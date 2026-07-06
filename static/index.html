@@ -139,6 +139,8 @@
   #chartTitle { font-size: 14px; font-weight: 600; margin: 0 0 4px; }
   #chartMeta { font-size: 12px; color: var(--muted); margin: 0 0 14px; font-family: var(--mono); }
   canvas { width: 100%; display: block; background: #101316; border: 1px solid var(--border); border-radius: 8px; }
+  #secondBins { margin-top: 14px; overflow-x: auto; }
+  #secondBins table { font-size: 12px; }
   .detail-grid { display: grid; grid-template-columns: minmax(260px, 0.9fr) minmax(420px, 1.4fr); gap: 20px; align-items: start; }
   #trackingFrameTitle { font-size: 14px; font-weight: 600; margin: 0 0 4px; }
   #trackingFrameMeta { font-size: 12px; color: var(--muted); margin: 0 0 14px; font-family: var(--mono); }
@@ -273,6 +275,7 @@
       <p id="chartTitle"></p>
       <p id="chartMeta"></p>
       <canvas id="chart" width="900" height="320"></canvas>
+      <div id="secondBins"></div>
     </div>
   </div>
 </div>
@@ -588,6 +591,31 @@
     drawChart(lastResults[idx]);
   }
 
+  function renderSecondBins(r) {
+    const bins = r.per_second_speed || [];
+    const wrap = $("secondBins");
+    if (!bins.length) {
+      wrap.innerHTML = "";
+      return;
+    }
+
+    const rows = bins.map((bin) => {
+      const avg = usesMm ? bin.avg_speed_mm_s : bin.avg_speed_px_s;
+      return "<tr>" +
+        '<td class="num">' + Number(bin.start_s).toFixed(1) + "-" + Number(bin.end_s).toFixed(1) + "s</td>" +
+        '<td class="num">' + fmt(avg) + "</td>" +
+        '<td class="num">' + fmt(bin.tracked_duration_s) + "</td>" +
+      "</tr>";
+    }).join("");
+
+    wrap.innerHTML =
+      "<table><thead><tr>" +
+      '<th class="num">second</th>' +
+      '<th class="num">avg (' + unitSpeed() + ")</th>" +
+      '<th class="num">tracked s</th>' +
+      "</tr></thead><tbody>" + rows + "</tbody></table>";
+  }
+
   function renderTrackingFrame(r) {
     if (!r.tracking_frame_image) {
       trackingFrameWrap.style.display = "none";
@@ -609,6 +637,7 @@
   function drawChart(r) {
     chartPanel.style.display = "block";
     renderTrackingFrame(r);
+    renderSecondBins(r);
     $("chartTitle").textContent = r.video + " · worm " + (r.worm_id || "—");
     const far = usesMm ? r.farthest_displacement_mm : r.farthest_displacement_px;
     const epName = r.tracked_endpoint_name || "center";

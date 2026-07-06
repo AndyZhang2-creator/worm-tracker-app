@@ -129,6 +129,11 @@ def main():
     assert r30["speed_series_px_s"][0] == 120.0, r30["speed_series_px_s"]
     assert r30["time_series_s"][0] > 0, r30["time_series_s"]
     assert len(r30["time_series_s"]) == len(r30["speed_series_px_s"])
+    # Per-second breakdown table: one bucket per second, each ~120 px/s.
+    assert r30["per_second_speed"][0]["avg_speed_px_s"] == 120.0, r30["per_second_speed"]
+    assert r30["per_second_speed"][1]["avg_speed_px_s"] == 120.0, r30["per_second_speed"]
+    assert len(r15["per_second_speed"]) == 3, r15["per_second_speed"]
+    assert r15["per_second_speed"][2]["avg_speed_px_s"] == 60.0, r15["per_second_speed"]
     assert r30["tracking_frame_image"].startswith("data:image/jpeg;base64,"), r30.keys()
     assert r30["tracking_frame_index"] == 0
     assert r30["tracking_frame_analyzed_index"] == 0
@@ -202,8 +207,11 @@ def main():
     assert header_px.startswith(",".join(app.CSV_BASE_COLUMNS))
     assert "avg_speed_px_s" in header_px
     assert "farthest_displacement_px" in header_px
+    assert "second_0_1_avg_speed_px_s" in header_px
+    assert "second_2_3_avg_speed_px_s" in header_px
     assert "broken.mp4" in csv_px
     assert "avg_speed_mm_s" in header_mm
+    assert "second_0_1_avg_speed_mm_s" in header_mm
     print("OK: CSV header + rows correct (px and mm variants, incl. displacement)")
     print("\nCSV preview (pixels):")
     print(csv_px.strip())
@@ -368,6 +376,16 @@ def test_roboflow_parser():
     ], max_tracks=1)
     assert no_jump_tracks[0]["frames"][1] is None, no_jump_tracks
     print("OK: top-five worm tracking — seeded five identities ignore later intruder")
+
+    low_conf_drift = app._select_same_worm_tracks([
+        [cand(100, 0.90, "seed")],
+        [cand(249, 0.20, "low-confidence-drift")],
+        [cand(0, 0.90, "reacquired-near-seed")],
+    ], max_tracks=1, pcutoff=0.5)
+    assert low_conf_drift[0]["frames"][1] is None, low_conf_drift
+    assert low_conf_drift[0]["centers"][1] is None, low_conf_drift
+    assert low_conf_drift[0]["frames"][2] is not None, low_conf_drift
+    print("OK: low-confidence centers do not steer final tracking")
 
     # Endpoint selection: default picks the greatest-displacement endpoint;
     # an untracked (None) endpoint never wins over a tracked one.

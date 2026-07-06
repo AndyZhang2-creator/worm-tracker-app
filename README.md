@@ -60,8 +60,6 @@ WORM_MAX_TRACKS=5             # seed and track up to five worms per video
 WORM_MAX_MATCH_DISTANCE_PX=150  # far detections become gaps instead of swaps
 WORM_TRACKING_FRAME_MAX_WIDTH=900  # max width of the labeled preview image
 WORM_LIVE_FRAME_MAX_WIDTH=720      # max width of the live detection preview
-WORM_ENDPOINT_INDEX=0         # pin a specific endpoint (0 or 1) instead of auto
-ROBOFLOW_TAIL_KEYPOINT=tail   # ...or pin the endpoint by class name
 ```
 
 Notes:
@@ -137,9 +135,8 @@ Then open <http://localhost:8000>.
 
 Per tracked worm (and as CSV columns):
 
-- **avg / max speed** — the average and peak center speed (px/frame, or
-  mm/frame if calibrated). The average is the headline "how fast the worm is
-  moving" in sampled-frame units.
+- **avg / max speed** — the average and peak center speed (px/s, or mm/s if
+  calibrated). The average is the headline "how fast the worm is moving".
 - **worm_id** — identity number seeded by confidence, up to five per video.
 - **tracking frame** (`tracking_frame_image`) - a JPEG data URL of the seed
   frame with the tracked worms labeled. The selected row's worm is highlighted

@@ -172,12 +172,8 @@ RF_MODEL_ID = os.environ.get("ROBOFLOW_MODEL_ID", "c-elegan-detection-5haae/6").
 RF_FALLBACK_MODEL_ID = os.environ.get("ROBOFLOW_FALLBACK_MODEL_ID", "c-elegan-detection-5haae/6").strip()
 _RF_CLIENT = None
 
-# Endpoint selection. This model emits two endpoints ("End-point1"=0,
-# "End-Point-2"=1) rather than head/tail, and the two ends of a worm move
-# differently. We first track the same worm detection across frames, then track
-# BOTH endpoints on that worm and report whichever moved farthest from its start.
-# Override to pin a specific endpoint by index (WORM_ENDPOINT_INDEX) or class
-# name (ROBOFLOW_TAIL_KEYPOINT).
+# Endpoint naming helpers kept for per-endpoint displacement diagnostics. The
+# headline speed/displacement tracks the worm center, not either endpoint.
 FORCE_ENDPOINT_NAME = os.environ.get("ROBOFLOW_TAIL_KEYPOINT", "").strip().lower()
 _force_idx_raw = os.environ.get("WORM_ENDPOINT_INDEX", "").strip()
 FORCE_ENDPOINT_INDEX = int(_force_idx_raw) if _force_idx_raw.lstrip("-").isdigit() else None
@@ -642,16 +638,31 @@ def _distance_sq(a, b) -> float:
     return (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2
 
 
-def _top_seed_candidates(candidates: list[dict], max_tracks: int) -> list[dict]:
-    viable = [c for c in (candidates or []) if c.get("keypoints") and _candidate_center(c) is not None]
+def _top_seed_candidates(candidates: list[dict], max_tracks: int, pcutoff: float | None = None) -> list[dict]:
+    viable = []
+    for candidate in candidates or []:
+        center = _center_with_conf(candidate)
+        if not candidate.get("keypoints") or center is None:
+            continue
+        if pcutoff is not None and center[2] < pcutoff:
+            continue
+        viable.append(candidate)
     return sorted(viable, key=lambda c: _safe_float(c.get("confidence"), 0.0), reverse=True)[:max_tracks]
 
 
-def _assign_candidates_to_tracks(tracks: list[dict], candidates: list[dict]) -> None:
-    viable = [c for c in (candidates or []) if c.get("keypoints") and _candidate_center(c) is not None]
+def _assign_candidates_to_tracks(tracks: list[dict], candidates: list[dict], pcutoff: float | None = None) -> None:
+    viable = []
+    for candidate in candidates or []:
+        center = _center_with_conf(candidate)
+        if not candidate.get("keypoints") or center is None:
+            continue
+        if pcutoff is not None and center[2] < pcutoff:
+            continue
+        viable.append(candidate)
     if not viable:
         for track in tracks:
             track["frames"].append(None)
+            track["centers"].append(None)
         return
 
     pairs = []
@@ -688,7 +699,11 @@ def _assign_candidates_to_tracks(tracks: list[dict], candidates: list[dict]) -> 
         track["last_center"] = _candidate_center(candidate)
 
 
-def _select_same_worm_tracks(frames_candidates: list[list[dict]], max_tracks: int = MAX_WORMS_PER_VIDEO):
+def _select_same_worm_tracks(
+    frames_candidates: list[list[dict]],
+    max_tracks: int = MAX_WORMS_PER_VIDEO,
+    pcutoff: float | None = DEFAULT_PCUTOFF,
+):
     """
     Seed up to `max_tracks` worm identities from the first frame with detections,
     using confidence order. Later frames assign detections one-to-one by nearest
@@ -697,7 +712,7 @@ def _select_same_worm_tracks(frames_candidates: list[list[dict]], max_tracks: in
     seed_frame = None
     seeds = []
     for frame_i, candidates in enumerate(frames_candidates):
-        seeds = _top_seed_candidates(candidates, max_tracks)
+        seeds = _top_seed_candidates(candidates, max_tracks, pcutoff=pcutoff)
         if seeds:
             seed_frame = frame_i
             break
@@ -717,7 +732,7 @@ def _select_same_worm_tracks(frames_candidates: list[list[dict]], max_tracks: in
         })
 
     for candidates in frames_candidates[seed_frame + 1:]:
-        _assign_candidates_to_tracks(tracks, candidates)
+        _assign_candidates_to_tracks(tracks, candidates, pcutoff=pcutoff)
 
     return tracks
 
@@ -1031,6 +1046,63 @@ def _tracking_frame_payloads(path: str, tracks: list[dict], native_fps: float, s
     return payloads
 
 
+def _per_second_speed_bins(speed_series_px_s: list, effective_fps: float, px_per_mm):
+    """
+    Average the worm's speed into one-second buckets. Each speed sample is the
+    interval between two analyzed frames, so intervals are duration-weighted when
+    they straddle a second boundary. Untracked (None/NaN) intervals are skipped,
+    so a bucket's average only reflects the time the worm was actually tracked.
+    """
+    if not speed_series_px_s or effective_fps <= 0:
+        return []
+
+    dt = 1.0 / effective_fps
+    total_duration = len(speed_series_px_s) * dt
+    n_bins = int(np.ceil(total_duration))
+    weighted_sums = [0.0 for _ in range(n_bins)]
+    valid_durations = [0.0 for _ in range(n_bins)]
+
+    for i, speed in enumerate(speed_series_px_s):
+        if speed is None:
+            continue
+        value = _safe_float(speed, np.nan)
+        if np.isnan(value):
+            continue
+
+        interval_start = i * dt
+        interval_end = (i + 1) * dt
+        first_bin = int(np.floor(interval_start))
+        last_bin = int(np.ceil(interval_end))
+        for bin_i in range(first_bin, min(last_bin, n_bins)):
+            overlap = min(interval_end, bin_i + 1.0) - max(interval_start, float(bin_i))
+            if overlap <= 0:
+                continue
+            weighted_sums[bin_i] += value * overlap
+            valid_durations[bin_i] += overlap
+
+    bins = []
+    for second in range(n_bins):
+        avg_px = (
+            weighted_sums[second] / valid_durations[second]
+            if valid_durations[second] > 0
+            else None
+        )
+        bucket = {
+            "second": second,
+            "start_s": round(float(second), 3),
+            "end_s": round(float(min(second + 1.0, total_duration)), 3),
+            "avg_speed_px_s": _round_or_none(avg_px),
+            "tracked_duration_s": round(float(valid_durations[second]), 3),
+        }
+        if px_per_mm:
+            bucket["avg_speed_mm_s"] = (
+                _round_or_none(avg_px / px_per_mm) if avg_px is not None else None
+            )
+        bins.append(bucket)
+
+    return bins
+
+
 def _smooth_positions(xs, ys, window: int):
     """
     Centered moving average of the position series over an odd `window`,
@@ -1113,6 +1185,9 @@ def _analyze_worm_track(
 
     metrics = compute_track_speed(xs, ys, confs, fps=effective_fps, pcutoff=pcutoff, px_per_mm=px_per_mm)
     disp = compute_displacement(xs, ys, confs, pcutoff=pcutoff, px_per_mm=px_per_mm)
+    per_second_speed = _per_second_speed_bins(
+        metrics["speed_series_px_s"], effective_fps=effective_fps, px_per_mm=px_per_mm
+    )
 
     # time_series_s is the x-axis for the chart: speed[i] covers the interval
     # between analyzed frame i and i+1, labeled by the time of the later frame.
@@ -1147,6 +1222,7 @@ def _analyze_worm_track(
         "tracked_endpoint_name": "center (worm body center)",
         "endpoints": per_endpoint,
         "speed_series_px_s": metrics["speed_series_px_s"],
+        "per_second_speed": per_second_speed,
         "time_series_s": time_series_s,
         "avg_speed_mm_s": _round_or_none(metrics.get("avg_speed_mm_s")),
         "max_speed_mm_s": _round_or_none(metrics.get("max_speed_mm_s")),
@@ -1223,7 +1299,9 @@ def analyze_video_file(path: str, sample_fps: float, pcutoff: float, px_per_mm, 
     if frames_analyzed == 0:
         raise ValueError("No frames could be decoded from this file.")
 
-    worm_tracks = _select_same_worm_tracks(frames_candidates, max_tracks=MAX_WORMS_PER_VIDEO)
+    worm_tracks = _select_same_worm_tracks(
+        frames_candidates, max_tracks=MAX_WORMS_PER_VIDEO, pcutoff=pcutoff
+    )
     if not worm_tracks:
         raise ValueError("No worm/keypoints were ever detected in this video.")
 
@@ -1358,8 +1436,21 @@ def _batch_summary(results: list[dict], used_mm: bool) -> dict:
     }
 
 
+def _per_second_csv_columns(results: list[dict], used_calibration: bool):
+    """One CSV column per second bucket (px/s, plus mm/s when calibrated)."""
+    max_bins = max((len(r.get("per_second_speed", [])) for r in results if "error" not in r), default=0)
+    columns = []
+    for second in range(max_bins):
+        columns.append((f"second_{second}_{second + 1}_avg_speed_px_s", second, "avg_speed_px_s"))
+        if used_calibration:
+            columns.append((f"second_{second}_{second + 1}_avg_speed_mm_s", second, "avg_speed_mm_s"))
+    return columns
+
+
 def _build_csv(results: list[dict], used_calibration: bool) -> str:
-    columns = CSV_BASE_COLUMNS + (CSV_MM_COLUMNS if used_calibration else [])
+    second_columns = _per_second_csv_columns(results, used_calibration)
+    base_columns = CSV_BASE_COLUMNS + (CSV_MM_COLUMNS if used_calibration else [])
+    columns = base_columns + [name for name, _, _ in second_columns]
     buf = io.StringIO()
     writer = csv.writer(buf)
     writer.writerow(columns)
@@ -1369,7 +1460,11 @@ def _build_csv(results: list[dict], used_calibration: bool) -> str:
             # CSV stays a clean rectangle that lines up with the header.
             row = [r.get("video", "")] + ["" for _ in columns[1:]]
         else:
-            row = [r.get(col, "") for col in columns]
+            row = [r.get(col, "") for col in base_columns]
+            per_second = r.get("per_second_speed", [])
+            for _, second, key in second_columns:
+                value = per_second[second].get(key) if second < len(per_second) else ""
+                row.append("" if value is None else value)
         writer.writerow(row)
     return buf.getvalue()
 

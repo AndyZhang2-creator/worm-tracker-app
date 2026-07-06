@@ -48,6 +48,9 @@ def compute_track_speed(xs, ys, confs, fps, pcutoff=0.5, px_per_mm=None):
     xs = np.asarray(xs, dtype=float)
     ys = np.asarray(ys, dtype=float)
     confs = np.asarray(confs, dtype=float)
+    fps = float(fps)
+    if fps <= 0:
+        raise ValueError("fps must be positive to compute speed in px/s")
 
     valid = confs >= pcutoff
     # Untracked frames become NaN positions. Crucially NOT zeroed and NOT
@@ -59,7 +62,7 @@ def compute_track_speed(xs, ys, confs, fps, pcutoff=0.5, px_per_mm=None):
     # Euclidean per-interval displacement in pixels. A NaN at either end of an
     # interval makes that interval's distance NaN, so it is excluded below.
     dist_px = np.sqrt(np.diff(x) ** 2 + np.diff(y) ** 2)
-    speed_px_s = dist_px / (1.0 / fps)
+    speed_px_s = dist_px * fps
 
     out = {
         "frames_tracked_pct": float(100 * np.mean(valid)) if len(valid) else 0.0,
