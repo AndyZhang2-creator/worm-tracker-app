@@ -30,6 +30,7 @@ import queue
 import secrets
 import tempfile
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import cv2
@@ -1232,6 +1233,21 @@ def _analyze_worm_track(
     }
 
 
+def _infer_concurrency() -> int:
+    """
+    How many frames to push through the detector at once. The hosted Roboflow
+    backend is one HTTP round-trip per frame, so a video's frames are
+    network-bound and running several in flight cuts wall-clock time sharply.
+    The local YOLO model stays sequential by default because concurrent
+    inference on a single model handle isn't guaranteed thread-safe. Override
+    with WORM_INFER_CONCURRENCY (a positive integer).
+    """
+    raw = os.environ.get("WORM_INFER_CONCURRENCY", "").strip()
+    if raw.isdigit() and int(raw) >= 1:
+        return int(raw)
+    return 6 if active_backend() == "roboflow" else 1
+
+
 def analyze_video_file(path: str, sample_fps: float, pcutoff: float, px_per_mm, progress_callback=None, overlap_tolerance: float = DEFAULT_OVERLAP_TOLERANCE):
     """
     Run inference over one video and return one result dict per tracked worm.
@@ -1265,10 +1281,9 @@ def analyze_video_file(path: str, sample_fps: float, pcutoff: float, px_per_mm, 
             "sample_step": step,
         })
 
-    # Sequential read + skip; only run inference every step-th frame. Keep ALL
-    # worm candidates until the identity tracker chooses one continuous worm.
-    frames_candidates = []  # each: list[candidate]
-    live_tracker = _LiveWormTracker(MAX_WORMS_PER_VIDEO) if progress_callback else None
+    # Pass 1 — decode only the frames we will actually run inference on, kept in
+    # frame order. Decoding is cheap and local; the expensive part is detection.
+    sampled = []  # (analyzed_index, source_frame_index, frame)
     frame_idx = 0
     analyzed_idx = 0
     while True:
@@ -1276,24 +1291,51 @@ def analyze_video_file(path: str, sample_fps: float, pcutoff: float, px_per_mm, 
         if not ok:
             break
         if frame_idx % step == 0:
-            candidates = detect(frame) or []
-            frames_candidates.append(candidates)
-            labeled = live_tracker.update(candidates) if live_tracker else []
-            if progress_callback and analyzed_idx % LIVE_FRAME_EVERY_N == 0:
-                progress_callback({
-                    "type": "frame",
-                    **_live_frame_payload(
-                        frame=frame,
-                        labeled=labeled,
-                        frame_index=frame_idx,
-                        analyzed_index=analyzed_idx,
-                        native_fps=native_fps,
-                    ),
-                    "frames_to_analyze": frames_to_analyze,
-                })
+            sampled.append((analyzed_idx, frame_idx, frame))
             analyzed_idx += 1
         frame_idx += 1
     cap.release()
+
+    # Pass 2 — run the detector. The hosted Roboflow backend is one HTTP
+    # round-trip per frame, so a batch of frames is network-bound: run several
+    # concurrently to cut wall-clock time. Results are consumed strictly IN
+    # ORDER, so the stable-identity live tracker and the final track assignment
+    # are byte-for-byte identical to the old sequential path — only the network
+    # waits overlap. The local model stays sequential by default.
+    frames_candidates = [None] * len(sampled)  # each: list[candidate]
+    live_tracker = _LiveWormTracker(MAX_WORMS_PER_VIDEO) if progress_callback else None
+
+    def _run_detect(item):
+        a_idx, f_idx, frame = item
+        return a_idx, f_idx, frame, (detect(frame) or [])
+
+    def _consume(a_idx, f_idx, frame, candidates):
+        frames_candidates[a_idx] = candidates
+        labeled = live_tracker.update(candidates) if live_tracker else []
+        if progress_callback and a_idx % LIVE_FRAME_EVERY_N == 0:
+            progress_callback({
+                "type": "frame",
+                **_live_frame_payload(
+                    frame=frame,
+                    labeled=labeled,
+                    frame_index=f_idx,
+                    analyzed_index=a_idx,
+                    native_fps=native_fps,
+                ),
+                "frames_to_analyze": frames_to_analyze,
+            })
+
+    concurrency = _infer_concurrency()
+    if concurrency > 1 and len(sampled) > 1:
+        # ThreadPoolExecutor.map runs up to `concurrency` detections at once but
+        # yields results in submission order, so the tracker sees frames in
+        # sequence while the network waits overlap.
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            for a_idx, f_idx, frame, candidates in pool.map(_run_detect, sampled):
+                _consume(a_idx, f_idx, frame, candidates)
+    else:
+        for item in sampled:
+            _consume(*_run_detect(item))
 
     frames_analyzed = len(frames_candidates)
     if frames_analyzed == 0:
@@ -1693,7 +1735,11 @@ async def analyze_stream(
     return StreamingResponse(
         event_stream(),
         media_type="application/x-ndjson",
-        headers={"Cache-Control": "no-cache"},
+        # X-Accel-Buffering: no tells nginx-style reverse proxies (e.g. Hugging
+        # Face Spaces) NOT to buffer the response. Without it the proxy holds the
+        # whole NDJSON stream and releases it at the end, so the live preview
+        # stays blank the entire run and only "pops" to results when finished.
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 

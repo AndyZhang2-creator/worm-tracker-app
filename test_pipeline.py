@@ -160,6 +160,26 @@ def main():
     assert frame_event["worm_ids"] == [1], frame_event
     assert streamed_rows[0]["avg_speed_px_s"] == r30["avg_speed_px_s"]
     print("OK: live progress events include annotated model-detection frames")
+
+    # Concurrent inference must match the sequential path exactly and still emit
+    # live frames in analyzed-index order (the tracker depends on that order).
+    os.environ["WORM_INFER_CONCURRENCY"] = "4"
+    try:
+        assert app._infer_concurrency() == 4
+        par_events = []
+        par_rows = app.analyze_video_file(
+            v30, sample_fps=10.0, pcutoff=0.5, px_per_mm=None,
+            progress_callback=par_events.append,
+        )
+        assert par_rows[0]["avg_speed_px_s"] == r30["avg_speed_px_s"], par_rows[0]["avg_speed_px_s"]
+        assert par_rows[0]["frames_tracked_pct"] == r30["frames_tracked_pct"]
+        assert par_rows[0]["total_distance_px"] == r30["total_distance_px"]
+        frame_idxs = [e["analyzed_index"] for e in par_events if e["type"] == "frame"]
+        assert frame_idxs == sorted(frame_idxs), frame_idxs
+    finally:
+        os.environ.pop("WORM_INFER_CONCURRENCY", None)
+    print(f"OK: parallel inference (x4) matches sequential, frames stay ordered "
+          f"({len(frame_idxs)} live frames)")
     # Both endpoints are reported for reference; the tracked point is the worm
     # CENTER (the detection center), and we measure how far and how fast it moves.
     assert len(r30["endpoints"]) == 2, r30["endpoints"]
