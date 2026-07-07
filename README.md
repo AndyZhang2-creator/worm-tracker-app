@@ -201,6 +201,22 @@ this README (`sdk: docker`, `app_port: 7860`) are all a Docker Space needs.
    ```
    The Space builds the Docker image and serves the app at
    `https://<user>-worm-tracker-app.hf.space`.
+
+### Auto-deploy from GitHub (recommended)
+
+Instead of pushing to the Space by hand, let GitHub mirror `master` to the
+Space on every change. The workflow at
+`.github/workflows/sync-to-huggingface.yml` does this — merging a PR to
+`master` redeploys the site automatically. One-time setup in the GitHub repo
+(**Settings → Secrets and variables → Actions**):
+
+- Secret **`HF_TOKEN`** — a Hugging Face **write** token
+  (<https://huggingface.co/settings/tokens>).
+- Variable **`HF_SPACE_ID`** — your Space id, e.g. `your-user/worm-tracker-app`.
+
+Then any push to `master` (or a manual run from the **Actions** tab) force-pushes
+the repo to the Space's `main` branch and triggers a rebuild. The token lives
+only in GitHub's encrypted secrets — never in the repo.
 3. Until you add the model, the site loads and shows the amber **"model not
    ready"** pill (every analyze call returns a clean 503). To enable inference,
    add the trained weights one of two ways:
