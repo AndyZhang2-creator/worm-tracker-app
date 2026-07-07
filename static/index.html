@@ -128,6 +128,10 @@
   th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--border); }
   th { color: var(--muted); font-weight: 500; font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; }
   td.num, th.num { text-align: right; }
+  th.sortable { cursor: pointer; user-select: none; transition: color 0.12s ease; white-space: nowrap; }
+  th.sortable:hover { color: var(--text); }
+  th.sortable.active { color: var(--accent); }
+  th .arrow { display: inline-block; width: 0.9em; opacity: 0.9; }
   tbody tr { cursor: pointer; transition: background 0.12s ease; }
   tbody tr:hover { background: #20262b; }
   tbody tr.selected { background: var(--accent-dim); }
@@ -253,15 +257,15 @@
 <div class="panel" id="resultsPanel" style="display:none">
   <table>
     <thead>
-      <tr>
-        <th>Video</th>
-        <th class="num">Worm</th>
-        <th class="num">% tracked</th>
-        <th class="num" id="hAvg">avg (px/s)</th>
-        <th class="num" id="hMax">max (px/s)</th>
-        <th class="num" id="hFar">farthest center (px)</th>
-        <th class="num" id="hNet">endpoint (px)</th>
-        <th class="num" id="hDist">distance (px)</th>
+      <tr id="resultsHead">
+        <th class="sortable" data-sort="video">Video</th>
+        <th class="num sortable" data-sort="worm_id">Worm</th>
+        <th class="num sortable" data-sort="frames_tracked_pct">% tracked</th>
+        <th class="num sortable" data-sort="avg_speed" id="hAvg">avg (px/s)</th>
+        <th class="num sortable" data-sort="max_speed" id="hMax">max (px/s)</th>
+        <th class="num sortable" data-sort="farthest_displacement" id="hFar">farthest center (px)</th>
+        <th class="num sortable" data-sort="net_displacement" id="hNet">endpoint (px)</th>
+        <th class="num sortable" data-sort="total_distance" id="hDist">distance (px)</th>
       </tr>
     </thead>
     <tbody id="resultsBody"></tbody>
@@ -308,6 +312,8 @@
   let chosenFiles = [];   // File[]
   let lastResults = [];   // result objects from the backend
   let usesMm = false;     // whether the current run used px_per_mm
+  let sortBase = null;    // which column the table is ordered by (null = as-run)
+  let sortDir = 1;        // 1 = ascending, -1 = descending
 
   // ---- Error surfacing (visible text, not just console) ------------------- //
   function showError(msg) {
@@ -533,15 +539,62 @@
     }
   }
 
+  // ---- Column sorting ----------------------------------------------------- //
+  function headerLabel(base) {
+    switch (base) {
+      case "video": return "Video";
+      case "worm_id": return "Worm";
+      case "frames_tracked_pct": return "% tracked";
+      case "avg_speed": return "avg (" + unitSpeed() + ")";
+      case "max_speed": return "max (" + unitSpeed() + ")";
+      case "farthest_displacement": return "farthest center (" + unitDist() + ")";
+      case "net_displacement": return "endpoint (" + unitDist() + ")";
+      case "total_distance": return "distance (" + unitDist() + ")";
+      default: return base;
+    }
+  }
+
+  // Map a column to the actual result key for the current unit (px vs mm).
+  function resolveSortKey(base) {
+    if (base === "avg_speed" || base === "max_speed") return base + (usesMm ? "_mm_s" : "_px_s");
+    if (base === "farthest_displacement" || base === "net_displacement" || base === "total_distance")
+      return base + (usesMm ? "_mm" : "_px");
+    return base; // video, worm_id, frames_tracked_pct
+  }
+
+  function sortResults() {
+    if (!sortBase) return;
+    const key = resolveSortKey(sortBase);
+    // Array.prototype.sort is stable, so ties (and failed rows) keep run order.
+    lastResults.sort((a, b) => {
+      const aErr = a.error ? 1 : 0, bErr = b.error ? 1 : 0;
+      if (aErr || bErr) return aErr - bErr;  // failed videos always sink to bottom
+      if (key === "video") return String(a.video || "").localeCompare(String(b.video || "")) * sortDir;
+      // Missing values sort as lowest, so a tracked worm always beats an untracked one.
+      const av = (a[key] === null || a[key] === undefined) ? -Infinity : Number(a[key]);
+      const bv = (b[key] === null || b[key] === undefined) ? -Infinity : Number(b[key]);
+      if (av < bv) return -sortDir;
+      if (av > bv) return sortDir;
+      return 0;
+    });
+  }
+
+  function updateSortIndicators() {
+    document.querySelectorAll("#resultsHead th.sortable").forEach((th) => {
+      const base = th.dataset.sort;
+      const active = base === sortBase;
+      th.classList.toggle("active", active);
+      const arrow = active ? (sortDir > 0 ? "▲" : "▼") : "";
+      th.innerHTML = escapeHtml(headerLabel(base)) + ' <span class="arrow">' + arrow + "</span>";
+    });
+  }
+
   function renderResults() {
     resultsPanel.style.display = lastResults.length ? "block" : "none";
     chartPanel.style.display = "none";
 
-    $("hAvg").textContent = "avg (" + unitSpeed() + ")";
-    $("hMax").textContent = "max (" + unitSpeed() + ")";
-    $("hFar").textContent = "farthest center (" + unitDist() + ")";
-    $("hNet").textContent = "endpoint (" + unitDist() + ")";
-    $("hDist").textContent = "distance (" + unitDist() + ")";
+    sortResults();
+    updateSortIndicators();
 
     resultsBody.innerHTML = "";
     lastResults.forEach((r, idx) => {
@@ -791,6 +844,20 @@
     const ratio = avgMm / avgPx;
     return series.map((v) => (v === null || v === undefined ? null : v * ratio));
   }
+
+  // Clicking a header sorts by that column; clicking it again flips direction.
+  document.querySelectorAll("#resultsHead th.sortable").forEach((th) => {
+    th.addEventListener("click", () => {
+      const base = th.dataset.sort;
+      if (sortBase === base) {
+        sortDir = -sortDir;
+      } else {
+        sortBase = base;
+        sortDir = base === "video" ? 1 : -1;  // names A→Z, numbers high→low first
+      }
+      renderResults();
+    });
+  });
 
   // ---- Init --------------------------------------------------------------- //
   loadModelStatus();
