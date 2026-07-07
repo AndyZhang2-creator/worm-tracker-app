@@ -199,6 +199,16 @@ def main():
           f"{summary['avg_speed']} px/s, farthest {summary['farthest_displacement']}px "
           f"in {summary['farthest_displacement_video']}")
 
+    # Averages across all videos/worms cover every data point, not just speed.
+    averages = summary["averages"]
+    assert abs(averages["avg_speed_px_s"] - summary["avg_speed"]) < 1e-6, averages
+    for key in ("max_speed_px_s", "total_distance_px", "farthest_displacement_px", "net_displacement_px", "frames_tracked_pct"):
+        assert averages.get(key) is not None, (key, averages)
+    assert "avg_speed_mm_s" not in averages, averages  # not calibrated -> mm keys omitted
+    mm_summary = app._batch_summary([rc], used_mm=True)
+    assert mm_summary["averages"]["avg_speed_mm_s"] is not None, mm_summary["averages"]
+    print(f"OK: batch averages across all data points — {averages}")
+
     # CSV building (pixels + mm variants), now including displacement columns.
     csv_px = app._build_csv(results, used_calibration=False)
     csv_mm = app._build_csv([rc], used_calibration=True)

@@ -167,6 +167,10 @@
   .stat-label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 4px; }
   .stat-val { font-size: 26px; color: var(--accent); }
   .stat-note { color: var(--muted); font-size: 12px; margin-top: 12px; font-family: var(--mono); }
+  #avgTable { margin-top: 18px; }
+  #avgTable .avg-heading { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 8px; }
+  #avgTable table { font-size: 13px; }
+  #avgTable td.num { font-family: var(--mono); }
 </style>
 </head>
 <body>
@@ -242,6 +246,7 @@
     <div class="stat"><div class="stat-label">farthest center moved</div><div class="stat-val" id="sFar">—</div></div>
   </div>
   <div class="stat-note" id="sNote"></div>
+  <div id="avgTable"></div>
 </div>
 
 <!-- Results -->
@@ -583,6 +588,36 @@
     }
     if (s.videos_failed) note += (note ? " · " : "") + s.videos_failed + " video(s) failed";
     $("sNote").textContent = note;
+    renderAverages(s.averages);
+  }
+
+  // Mean of every data point across all analyzed videos/worms in the batch.
+  const AVG_ROWS = [
+    ["frames_tracked_pct", "% tracked", ""],
+    ["avg_speed_px_s", "avg speed", "px/s"],
+    ["max_speed_px_s", "max speed", "px/s"],
+    ["total_distance_px", "distance", "px"],
+    ["farthest_displacement_px", "farthest center", "px"],
+    ["net_displacement_px", "endpoint", "px"],
+    ["avg_speed_mm_s", "avg speed", "mm/s"],
+    ["max_speed_mm_s", "max speed", "mm/s"],
+    ["total_distance_mm", "distance", "mm"],
+    ["farthest_displacement_mm", "farthest center", "mm"],
+    ["net_displacement_mm", "endpoint", "mm"],
+  ];
+
+  function renderAverages(averages) {
+    const wrap = $("avgTable");
+    if (!averages) { wrap.innerHTML = ""; return; }
+    const rows = AVG_ROWS.filter(([key]) => averages[key] !== undefined)
+      .map(([key, label, unit]) =>
+        "<tr><td>" + escapeHtml(label) + (unit ? " (" + unit + ")" : "") + "</td>" +
+        '<td class="num">' + fmt(averages[key]) + "</td></tr>"
+      ).join("");
+    if (!rows) { wrap.innerHTML = ""; return; }
+    wrap.innerHTML =
+      '<div class="avg-heading">averages across all videos</div>' +
+      "<table><tbody>" + rows + "</tbody></table>";
   }
 
   function selectRow(idx, tr) {

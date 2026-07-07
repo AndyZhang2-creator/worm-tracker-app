@@ -1403,25 +1403,57 @@ CSV_MM_COLUMNS = [
 ]
 
 
+# Every per-worm data point to average across the batch: (key, mm-only?).
+_AVERAGE_METRICS = [
+    ("frames_tracked_pct", False),
+    ("avg_speed_px_s", False),
+    ("max_speed_px_s", False),
+    ("total_distance_px", False),
+    ("farthest_displacement_px", False),
+    ("net_displacement_px", False),
+    ("avg_speed_mm_s", True),
+    ("max_speed_mm_s", True),
+    ("total_distance_mm", True),
+    ("farthest_displacement_mm", True),
+    ("net_displacement_mm", True),
+]
+
+
+def _mean(values: list) -> float | None:
+    vals = [v for v in values if v is not None]
+    return round(sum(vals) / len(vals), 3) if vals else None
+
+
 def _batch_summary(results: list[dict], used_mm: bool) -> dict:
     """
-    Aggregate the headline numbers the user asked for across a batch:
-      - average speed the worms are moving (mean of per-video averages)
-      - how far the farthest tracked center moved, and which video that was.
-    Failed videos and videos with no trackable speed are excluded from means.
+    Aggregate the headline numbers the user asked for across every tracked
+    worm in the batch:
+      - average speed the worms are moving (mean of per-worm averages)
+      - how far the farthest tracked center moved, and which video that was
+      - the mean of every other reported data point (distance, endpoint
+        displacement, % tracked, ...), across all videos/worms in the batch.
+    Failed videos and worms with no trackable value for a given metric are
+    excluded from that metric's mean.
     """
     speed_key = "avg_speed_mm_s" if used_mm else "avg_speed_px_s"
     far_key = "farthest_displacement_mm" if used_mm else "farthest_displacement_px"
     ok = [r for r in results if "error" not in r]
 
-    speeds = [r[speed_key] for r in ok if r.get(speed_key) is not None]
-    avg_speed = round(sum(speeds) / len(speeds), 3) if speeds else None
+    avg_speed = _mean([r.get(speed_key) for r in ok])
 
     far_video, far_worm_id, far_value = None, None, None
     for r in ok:
         v = r.get(far_key)
         if v is not None and (far_value is None or v > far_value):
             far_value, far_video, far_worm_id = v, r.get("video"), r.get("worm_id")
+
+    # Mean of every numeric data point across all analyzed worms/videos, in
+    # both px and (when calibrated) mm units — not just the headline speed.
+    averages = {
+        key: _mean([r.get(key) for r in ok])
+        for key, mm_only in _AVERAGE_METRICS
+        if not mm_only or used_mm
+    }
 
     return {
         "videos_total": len(results),
@@ -1433,6 +1465,7 @@ def _batch_summary(results: list[dict], used_mm: bool) -> dict:
         "farthest_displacement": round(far_value, 3) if far_value is not None else None,
         "farthest_displacement_video": far_video,
         "farthest_displacement_worm_id": far_worm_id,
+        "averages": averages,
     }
 
 
