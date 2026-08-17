@@ -41,6 +41,8 @@ from fastapi.responses import Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from speed_utils import compute_displacement, compute_track_speed
+from stabilize_utils import StabilizationUnavailableError
+from stabilize_utils import stabilize_video as _stabilize_video
 
 # --------------------------------------------------------------------------- #
 # Paths / config
@@ -1417,6 +1419,24 @@ def _save_upload_to_temp(upload: UploadFile) -> str:
     return tmp_path
 
 
+def _maybe_stabilize(path: str, stabilize: bool) -> str:
+    """
+    If requested, run the AI (Hugging Face) stabilizer over `path` and return
+    the path to the stabilized copy; otherwise return `path` unchanged.
+
+    A missing/unloadable stabilizer is treated the same way a missing
+    detection model is (HTTPException 503, actionable message) since it's a
+    setup problem, not a bad video. A video the stabilizer can't process
+    (ValueError) is left to the caller, same as analyze_video_file errors.
+    """
+    if not stabilize:
+        return path
+    try:
+        return _stabilize_video(path)
+    except StabilizationUnavailableError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
 # --------------------------------------------------------------------------- #
 # CSV building
 # --------------------------------------------------------------------------- #
@@ -1588,6 +1608,21 @@ def model_status():
         return {"ready": False, "backend": backend, "detail": exc.detail}
 
 
+@app.get("/api/stabilize-status")
+def stabilize_status():
+    """
+    Report whether the AI (Hugging Face) video stabilizer is ready, without
+    ever 503-ing. First call downloads the model weights if not cached.
+    """
+    from stabilize_utils import HF_MODEL_ID, _get_stabilizer
+
+    try:
+        _get_stabilizer()
+        return {"ready": True, "model": HF_MODEL_ID}
+    except StabilizationUnavailableError as exc:
+        return {"ready": False, "model": HF_MODEL_ID, "detail": str(exc)}
+
+
 @app.post("/api/analyze")
 async def analyze(
     file: UploadFile = File(...),
@@ -1595,10 +1630,13 @@ async def analyze(
     pcutoff: float = Form(DEFAULT_PCUTOFF),
     px_per_mm: float | None = Form(None),
     overlap_tolerance: float = Form(DEFAULT_OVERLAP_TOLERANCE),
+    stabilize: bool = Form(False),
 ):
     tmp_path = _save_upload_to_temp(file)
+    analysis_path = tmp_path
     try:
-        results = analyze_video_file(tmp_path, sample_fps, pcutoff, px_per_mm, overlap_tolerance=overlap_tolerance)
+        analysis_path = _maybe_stabilize(tmp_path, stabilize)
+        results = analyze_video_file(analysis_path, sample_fps, pcutoff, px_per_mm, overlap_tolerance=overlap_tolerance)
         # Preserve the original uploaded filename rather than the temp name.
         for result in results:
             result["video"] = file.filename or result["video"]
@@ -1607,6 +1645,8 @@ async def analyze(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     finally:
         _safe_unlink(tmp_path)
+        if analysis_path != tmp_path:
+            _safe_unlink(analysis_path)
 
 
 @app.post("/api/analyze-batch")
@@ -1616,23 +1656,30 @@ async def analyze_batch(
     pcutoff: float = Form(DEFAULT_PCUTOFF),
     px_per_mm: float | None = Form(None),
     overlap_tolerance: float = Form(DEFAULT_OVERLAP_TOLERANCE),
+    stabilize: bool = Form(False),
 ):
     results: list[dict] = []
     for upload in files:
         tmp_path = _save_upload_to_temp(upload)
+        analysis_path = tmp_path
         try:
-            video_results = analyze_video_file(tmp_path, sample_fps, pcutoff, px_per_mm, overlap_tolerance=overlap_tolerance)
+            analysis_path = _maybe_stabilize(tmp_path, stabilize)
+            video_results = analyze_video_file(analysis_path, sample_fps, pcutoff, px_per_mm, overlap_tolerance=overlap_tolerance)
             for res in video_results:
                 res["video"] = upload.filename or res["video"]
                 results.append(res)
         except HTTPException:
-            # Model not ready — this is fatal for the whole batch, not per-video.
+            # Model/stabilizer not ready — fatal for the whole batch, not per-video.
             _safe_unlink(tmp_path)
+            if analysis_path != tmp_path:
+                _safe_unlink(analysis_path)
             raise
         except Exception as exc:  # noqa: BLE001 - one bad video must not abort
             results.append({"video": upload.filename or "unknown", "error": str(exc)})
         finally:
             _safe_unlink(tmp_path)
+            if analysis_path != tmp_path:
+                _safe_unlink(analysis_path)
 
     csv_text = _build_csv(results, used_calibration=bool(px_per_mm))
     token = secrets.token_hex(16)
@@ -1655,6 +1702,7 @@ async def analyze_stream(
     pcutoff: float = Form(DEFAULT_PCUTOFF),
     px_per_mm: float | None = Form(None),
     overlap_tolerance: float = Form(DEFAULT_OVERLAP_TOLERANCE),
+    stabilize: bool = Form(False),
 ):
     jobs = []
     for upload in files:
@@ -1684,9 +1732,13 @@ async def analyze_stream(
                         payload["video_total"] = len(jobs)
                         put(payload)
 
+                    analysis_path = path
                     try:
+                        if stabilize:
+                            progress({"type": "stabilizing"})
+                        analysis_path = _maybe_stabilize(path, stabilize)
                         video_results = analyze_video_file(
-                            path,
+                            analysis_path,
                             sample_fps=sample_fps,
                             pcutoff=pcutoff,
                             px_per_mm=px_per_mm,
@@ -1709,6 +1761,9 @@ async def analyze_stream(
                             "video_total": len(jobs),
                             "error": error,
                         })
+                    finally:
+                        if analysis_path != path:
+                            _safe_unlink(analysis_path)
 
                 csv_text = _build_csv(results, used_calibration=bool(px_per_mm))
                 token = secrets.token_hex(16)

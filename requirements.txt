@@ -6,3 +6,5 @@ numpy
 httpx
 ultralytics
 inference-sdk; python_version < "3.13"
+torch
+transformers
