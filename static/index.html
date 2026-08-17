@@ -183,9 +183,15 @@
     <h1>Worm Tail Tracker</h1>
     <p class="subtitle">Pose-tracked worm movement for <em>C. elegans</em> clips.</p>
   </div>
-  <div class="pill" id="modelPill">
-    <span class="dot" id="modelDot"></span>
-    <span id="modelText">checking model…</span>
+  <div style="display:flex; gap:8px; flex-wrap:wrap;">
+    <div class="pill" id="modelPill">
+      <span class="dot" id="modelDot"></span>
+      <span id="modelText">checking model…</span>
+    </div>
+    <div class="pill" id="stabilizePill">
+      <span class="dot" id="stabilizeDot"></span>
+      <span id="stabilizeText">checking AI stabilizer…</span>
+    </div>
   </div>
 </header>
 
@@ -218,6 +224,10 @@
     <div class="field">
       <label for="overlapTol">overlap tolerance</label>
       <input type="number" id="overlapTol" value="0.9" min="0" max="1" step="0.05" title="If two boxes overlap by more than this fraction, keep only the higher-confidence one. 1 = off." />
+    </div>
+    <div class="field">
+      <label for="stabilize">stabilize shaky video (AI)</label>
+      <input type="checkbox" id="stabilize" title="Run an AI (Hugging Face) stabilizer over each video before analysis. Slower, but helps tracking on shaky microscope footage." />
     </div>
   </div>
   <div class="actions">
@@ -345,6 +355,25 @@
     }
   }
 
+  // ---- AI stabilizer status pill ------------------------------------------- //
+  async function loadStabilizeStatus() {
+    try {
+      const res = await fetch("/api/stabilize-status");
+      const data = await res.json();
+      if (data.ready) {
+        $("stabilizeDot").className = "dot ok";
+        $("stabilizeText").innerHTML = "AI stabilizer ready";
+      } else {
+        $("stabilizeDot").className = "dot bad";
+        $("stabilizeText").innerHTML =
+          '<span class="detail">AI stabilizer not ready — ' + escapeHtml(data.detail || "") + "</span>";
+      }
+    } catch (e) {
+      $("stabilizeDot").className = "dot bad";
+      $("stabilizeText").innerHTML = '<span class="detail">backend unreachable</span>';
+    }
+  }
+
   function escapeHtml(s) {
     const d = document.createElement("div");
     d.textContent = s;
@@ -410,6 +439,7 @@
     fd.append("pcutoff", pcutoff);
     fd.append("overlap_tolerance", overlapTol);
     if (usesMm) fd.append("px_per_mm", pxPerMm);
+    fd.append("stabilize", $("stabilize").checked ? "true" : "false");
 
     // Always use the batch endpoint so we get a CSV token and uniform handling,
     // even for a single file.
@@ -471,6 +501,14 @@
   }
 
   function handleStreamEvent(event) {
+    if (event.type === "stabilizing") {
+      livePanel.style.display = "block";
+      $("liveStatus").textContent = "Stabilizing " + (event.video || "video") + " (AI)…";
+      $("liveMeta").textContent =
+        "video " + event.video_index + "/" + event.video_total + " | removing camera shake before analysis";
+      return;
+    }
+
     if (event.type === "video_start") {
       livePanel.style.display = "block";
       liveProgressBar.style.width = "0%";
@@ -861,6 +899,7 @@
 
   // ---- Init --------------------------------------------------------------- //
   loadModelStatus();
+  loadStabilizeStatus();
 })();
 </script>
 </body>

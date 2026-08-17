@@ -82,6 +82,46 @@ Notes:
 - One HTTP round-trip per sampled frame, so hosted workflow inference is slower
   than local weights.
 
+## Stabilizing shaky video (AI)
+
+Handheld or vibration-prone microscope rigs produce shaky clips, and camera
+shake shows up as tracking noise (or dropped confidence) in the results. Check
+**stabilize shaky video (AI)** before analyzing to remove it first.
+
+Stabilization runs entirely locally, using the Hugging Face
+[`magic-leap-community/superpoint`](https://huggingface.co/magic-leap-community/superpoint)
+keypoint detector (via `transformers`) to find learned feature points in each
+frame — the same "point feature matching" recipe classic stabilizers use
+(track points across frames, integrate the motion into a trajectory, smooth
+the trajectory, warp each frame by the difference), but with a learned
+feature detector in place of a hand-crafted one, which holds up much better
+on low-contrast, low-texture microscope footage. The first request that
+needs it downloads the small (~5 MB) model weights from the Hugging Face
+Hub and caches them; after that it runs offline.
+
+It's opt-in per request (unchecked by default) because it adds noticeable
+processing time per video. The **AI stabilizer** status pill in the header
+shows whether the model has loaded; `GET /api/stabilize-status` reports the
+same thing (and triggers the first-time download) without ever failing the
+request.
+
+Tuning knobs (sensible defaults already set):
+
+```bash
+WORM_STABILIZE_MODEL_ID=magic-leap-community/superpoint
+WORM_STABILIZE_KEYPOINT_THRESHOLD=0.003   # lower = keep more (noisier) keypoints
+WORM_STABILIZE_MAX_KEYPOINTS=1024
+WORM_STABILIZE_MATCH_RATIO=0.85           # Lowe's ratio test; higher = more permissive matches
+WORM_STABILIZE_MAX_DIMENSION=480          # frame size used for keypoint detection (speed)
+WORM_STABILIZE_SMOOTHING_RADIUS=15        # frames averaged when smoothing the shake trajectory
+WORM_STABILIZE_MIN_MATCHES=4              # below this, treat the frame pair as motionless
+WORM_STABILIZE_BORDER_CROP=0.04           # crop-and-rescale fraction to hide warp borders
+```
+
+If a clip has very little visual texture, matching between frames can fail
+more often — lower `WORM_STABILIZE_KEYPOINT_THRESHOLD` and/or
+`WORM_STABILIZE_MIN_MATCHES` first.
+
 ## Add your trained model
 
 Export your trained Ultralytics YOLO-pose weights and place them at:
@@ -121,6 +161,9 @@ Then open <http://localhost:8000>.
      *untracked* (a gap), not as zero movement (see "Why gaps" below).
    - **px_per_mm** (optional) — leave blank to stay in pixels; set it to convert
      every speed/distance to millimetres.
+   - **stabilize shaky video (AI)** (default off) — run the Hugging Face AI
+     stabilizer over each video before analysis (see "Stabilizing shaky
+     video (AI)" above).
 3. Click **Analyze**. While the run is in progress, the page shows each sampled
    frame as it comes back from the model with stable `worm 1`, `worm 2`, etc.
    labels. Those labels are seeded once and then matched by nearest center, so a
@@ -180,6 +223,7 @@ Both corrupt the data. The only correct behavior is to skip the interval. See
 | POST   | `/api/analyze-stream`  | Analyze many videos as NDJSON progress events, including live detection frames, then final results.|
 | GET    | `/api/download/{token}`| Download the batch summary CSV.            |
 | GET    | `/api/model-status`    | `{ "ready": true }` or a reason it isn't.  |
+| GET    | `/api/stabilize-status`| `{ "ready": true }` or a reason the AI stabilizer isn't. |
 
 A request that needs the model but can't find/load it returns **503** with an
 actionable message (where to put `best.pt`). One bad video in a batch returns an
@@ -235,6 +279,7 @@ docker run -p 7860:7860 worm-tracker` serves it locally on port 7860.
 worm-tracker-app/
   app.py            # FastAPI app, all endpoints
   speed_utils.py    # the speed algorithm, isolated and testable
+  stabilize_utils.py # AI (Hugging Face) video stabilization, isolated and testable
   requirements.txt
   model/
     best.pt         # NOT included — add after training

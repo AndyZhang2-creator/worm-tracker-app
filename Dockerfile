@@ -12,8 +12,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Install CPU-only torch FIRST so ultralytics doesn't drag in the multi-GB
-# CUDA build. This keeps the Space image lean and the build within free limits.
+# Install CPU-only torch FIRST so ultralytics/transformers don't drag in the
+# multi-GB CUDA build. This keeps the Space image lean and the build within
+# free limits. Both the YOLO detector and the Hugging Face AI stabilizer run
+# on this same CPU torch install.
 RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
 
 COPY requirements.txt .
